@@ -1,5 +1,8 @@
 name: Create and Publish Release
 
+permissions:
+  contents: write
+
 on:
   push:
     branches:
@@ -11,10 +14,10 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v7
 
     - name: Cache Python packages
-      uses: actions/cache@v3
+      uses: actions/cache@v6
       with:
         path: ~/.cache/pip
         key: python-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
@@ -22,7 +25,7 @@ jobs:
           python-${{ runner.os }}-
 
     - name: Cache Python 2.7 Source
-      uses: actions/cache@v3
+      uses: actions/cache@v6
       with:
         path: ~/Python-2.7.18
         key: python2-source-${{ runner.os }}-${{ hashFiles('**/Python-2.7.18.tgz') }}
@@ -30,7 +33,7 @@ jobs:
           python2-source-${{ runner.os }}-
 
     - name: Cache xtensa toolchain
-      uses: actions/cache@v3
+      uses: actions/cache@v6
       with:
         path: ~/esp/xtensa-lx106-elf
         key: xtensa-${{ runner.os }}-${{ hashFiles('**/xtensa-lx106-elf-gcc8_4_0-esp-2020r3-linux-amd64.tar.gz') }}
@@ -72,6 +75,7 @@ jobs:
         cd ~/esp
         git clone --recursive https://github.com/espressif/ESP8266_RTOS_SDK.git
         export IDF_PATH=~/esp/ESP8266_RTOS_SDK
+        echo "IDF_PATH=$IDF_PATH" >> "$GITHUB_ENV"
         sed -i 's/pyelftools>=0.22/pyelftools==0.22/' $IDF_PATH/requirements.txt
         python2.7 -m pip install --user -r $IDF_PATH/requirements.txt
 
@@ -80,7 +84,7 @@ jobs:
         cd ~/esp
         wget -c https://dl.espressif.com/dl/xtensa-lx106-elf-gcc8_4_0-esp-2020r3-linux-amd64.tar.gz
         tar -xzf xtensa-lx106-elf-gcc8_4_0-esp-2020r3-linux-amd64.tar.gz
-        export PATH="$PATH:$HOME/esp/xtensa-lx106-elf/bin"
+        echo "$HOME/esp/xtensa-lx106-elf/bin" >> "$GITHUB_PATH"
 
     - name: Run Make
       run: |
@@ -101,7 +105,7 @@ jobs:
         GH_TOKEN: ${{ secrets.PAT_TOKEN }}
 
     - name: Upload compressed file as artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: firmware
         path: release/firmware-*.tar.gz
