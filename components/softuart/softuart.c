@@ -23,7 +23,12 @@
 #include "softuart.h"
 #include <stdint.h>
 #include "driver/gpio.h"
+#include "driver/soc.h"
+#include "esp8266/gpio_struct.h"
+#include "esp_attr.h"
+#include "esp_clk.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
 
 #include "rom/ets_sys.h"
 
@@ -34,11 +39,13 @@ _Static_assert(SOFTUART_MAX_RX_BUFF >= 2 && SOFTUART_MAX_RX_BUFF <= 256
                && (SOFTUART_MAX_RX_BUFF & (SOFTUART_MAX_RX_BUFF - 1)) == 0,
                "SOFTUART_MAX_RX_BUFF must be a power of two between 2 and 256");
 
-// Highest baud rate whose bit time is still at least 1 us
-#define SOFTUART_MAX_BAUDRATE 1000000
+// Idle bit times added after the stop bit of each transmitted byte
+#ifndef CONFIG_SOFTUART_TX_EXTRA_IDLE_BITS
+#define CONFIG_SOFTUART_TX_EXTRA_IDLE_BITS 0
+#endif
 
-// Free-running 32-bit microsecond timer (wraps every ~71.6 minutes)
-extern uint32_t esp_get_time(void);
+// Highest supported baud rate (a bit is then 80 cycles at 80 MHz)
+#define SOFTUART_MAX_BAUDRATE 1000000
 
 typedef struct
 {
@@ -53,7 +60,10 @@ typedef struct
     uint32_t rx_pin, tx_pin;
     uint32_t baudrate;
     volatile softuart_buffer_t buffer;
-    uint32_t bit_time;
+    uint32_t rx_mask;    // 1 << rx_pin, for reading GPIO.in
+    uint32_t tx_mask;    // 1 << tx_pin, or 0 for GPIO16 (RTC GPIO)
+    uint32_t bit_cycles; // whole CPU cycles per bit: cpu_hz / baudrate
+    uint32_t bit_frac;   // cpu_hz % baudrate, spread over the frame
     bool invert;
 } softuart_t;
 
@@ -64,46 +74,85 @@ static uint8_t open_uarts;
 // True if softuart installed the GPIO ISR service (and so may uninstall it)
 static bool isr_service_owned;
 
-// Busy-wait until `us` microseconds have passed since `start`. The unsigned
-// subtraction stays correct when the timer wraps around.
-static inline void wait_until(uint32_t start, uint32_t us)
+// Bit boundaries in CPU cycles since the start of a frame. The fractional
+// part of the bit period is carried over (Bresenham), so a boundary is never
+// more than one cycle away from its exact position, at any baud rate.
+typedef struct
 {
-    while ((uint32_t)(esp_get_time() - start) < us)
+    uint32_t cycles;
+    uint32_t err;
+} bit_clock_t;
+
+static inline void IRAM_ATTR bit_clock_advance(const softuart_t *uart, bit_clock_t *clk)
+{
+    clk->cycles += uart->bit_cycles;
+    clk->err += uart->bit_frac;
+    if (clk->err >= uart->baudrate)
+    {
+        clk->err -= uart->baudrate;
+        clk->cycles++;
+    }
+}
+
+// Busy-wait until `cycles` CPU cycles have passed since `start`. The unsigned
+// subtraction stays correct when the cycle counter wraps around (every 26.8 s
+// at 160 MHz).
+static inline void IRAM_ATTR wait_cycles(uint32_t start, uint32_t cycles)
+{
+    while ((uint32_t)(soc_get_ccount() - start) < cycles)
     {
     }
 }
 
-// Busy-wait for `us` microseconds. Unlike ets_delay_us(), which is the ROM's
-// os_delay_us(uint16_t), this does not truncate delays above 65535 us.
-static inline void delay_us(uint32_t us)
+// The interrupt handler and the transmit loop access the GPIO registers
+// directly instead of calling the (flash-resident) GPIO driver, so a flash
+// cache miss cannot delay a sample or a bit edge.
+static inline void IRAM_ATTR rx_arm(const softuart_t *uart, bool enable)
 {
-    wait_until(esp_get_time(), us);
+    GPIO.pin[uart->rx_pin].int_type = !enable ? GPIO_INTR_DISABLE
+                                    : uart->invert ? GPIO_INTR_POSEDGE : GPIO_INTR_NEGEDGE;
+}
+
+static inline bool IRAM_ATTR rx_level(const softuart_t *uart)
+{
+    return (GPIO.in & uart->rx_mask) != 0;
+}
+
+static inline void IRAM_ATTR tx_write(const softuart_t *uart, bool level)
+{
+    if (!uart->tx_mask)
+        gpio_set_level(uart->tx_pin, level); // GPIO16 is not in the GPIO block
+    else if (level)
+        GPIO.out_w1ts = uart->tx_mask;
+    else
+        GPIO.out_w1tc = uart->tx_mask;
 }
 
 // GPIO interrupt handler, called on the leading edge of a start bit
-static void handle_rx(void *arg)
+static void IRAM_ATTR handle_rx(void *arg)
 {
+    // Handler entry stands in for the time of the start-bit edge
+    const uint32_t start = soc_get_ccount();
     softuart_t *uart = (softuart_t *)arg;
     if (!uart->baudrate) return;
 
     // Disable interrupt
-    gpio_set_intr_type(uart->rx_pin, GPIO_INTR_DISABLE);
+    rx_arm(uart, false);
 
-    // Wait till start bit is half over so we can sample the next one in the center
-    delay_us(uart->bit_time / 2);
-
-    // Now sample bits
+    // Sample each data bit in its middle: 1.5, 2.5, ... 8.5 bit periods
+    // after the start edge
+    bit_clock_t clk = { uart->bit_cycles / 2, 0 };
     uint8_t d = 0;
-    uint32_t start_time = esp_get_time();
 
     for (uint8_t i = 0; i < 8; i++)
     {
-        wait_until(start_time, uart->bit_time * (i + 1));
+        bit_clock_advance(uart, &clk);
+        wait_cycles(start, clk.cycles);
         // Shift d to the right
         d >>= 1;
 
         // Read bit
-        if (gpio_get_level(uart->rx_pin) ^ uart->invert)
+        if (rx_level(uart) ^ uart->invert)
         {
             // If high, set msb of 8bit to 1
             d |= 0x80;
@@ -124,11 +173,39 @@ static void handle_rx(void *arg)
         uart->buffer.buffer_overflow = 1;
     }
 
-    // Wait for stop bit
-    delay_us(uart->bit_time);
+    // Wait for the middle of the stop bit, then re-arm for the next start bit
+    bit_clock_advance(uart, &clk);
+    wait_cycles(start, clk.cycles);
+    rx_arm(uart, true);
+}
 
-    // Done, reenable interrupt
-    gpio_set_intr_type(uart->rx_pin, uart->invert ? GPIO_INTR_POSEDGE : GPIO_INTR_NEGEDGE);
+// Transmit one 8N1 frame. Runs from IRAM so that a flash cache miss cannot
+// stretch a bit.
+static void IRAM_ATTR send_frame(const softuart_t *uart, uint8_t data)
+{
+    // Bit 0 is the start bit (0), bits 1-8 the data LSB first, bit 9 the stop bit (1)
+    const uint32_t frame = ((uint32_t)data << 1) | (1u << 9);
+    bit_clock_t clk = { 0, 0 };
+
+#ifdef CONFIG_SOFTUART_TX_CRITICAL_SECTION
+    portENTER_CRITICAL();
+#endif
+    const uint32_t start = soc_get_ccount();
+    for (uint8_t i = 0; i < 10; i++)
+    {
+        wait_cycles(start, clk.cycles);
+        tx_write(uart, ((frame >> i) & 1) ^ uart->invert);
+        bit_clock_advance(uart, &clk);
+    }
+#ifdef CONFIG_SOFTUART_TX_CRITICAL_SECTION
+    // An interrupt during the stop bit only lengthens it, which is harmless
+    portEXIT_CRITICAL();
+#endif
+
+    // Hold the stop bit, plus any configured idle time, before the next frame
+    for (int i = 0; i < CONFIG_SOFTUART_TX_EXTRA_IDLE_BITS; i++)
+        bit_clock_advance(uart, &clk);
+    wait_cycles(start, clk.cycles);
 }
 
 static bool check_uart_no(uint8_t uart_no)
@@ -214,9 +291,12 @@ bool softuart_open(uint8_t uart_no, uint32_t baudrate, uint32_t rx_pin, uint32_t
     uart->buffer.receive_buffer_tail = 0;
     uart->buffer.buffer_overflow = 0;
 
-    // Calculate bit_time
-    uart->bit_time = (1000000 / baudrate);
-    if (((100000000 / baudrate) - (100 * uart->bit_time)) > 50) uart->bit_time++;
+    // Bit period in CPU cycles, with the remainder kept for exact timing
+    const uint32_t cpu_hz = (uint32_t)esp_clk_cpu_freq();
+    uart->bit_cycles = cpu_hz / baudrate;
+    uart->bit_frac = cpu_hz % baudrate;
+    uart->rx_mask = 1UL << rx_pin;
+    uart->tx_mask = tx_pin < 16 ? 1UL << tx_pin : 0;
 
     // Setup Rx
     gpio_config_t io_conf;
@@ -281,24 +361,8 @@ bool softuart_put(uint8_t uart_no, char c)
 {
     if (!check_uart_no(uart_no)) return false;
     if (!check_uart_enabled(uart_no)) return false;
-    softuart_t *uart = uarts + uart_no;
-    const uint8_t data = (uint8_t)c;
 
-    // Start bit
-    uint32_t start_time = esp_get_time();
-    gpio_set_level(uart->tx_pin, uart->invert);
-
-    // Data bits, LSB first
-    for (uint8_t i = 0; i < 8; i++)
-    {
-        wait_until(start_time, uart->bit_time * (i + 1));
-        gpio_set_level(uart->tx_pin, ((data >> i) & 1) ^ uart->invert);
-    }
-
-    // Stop bit, followed by idle time before the next byte
-    wait_until(start_time, uart->bit_time * 9);
-    gpio_set_level(uart->tx_pin, !uart->invert);
-    delay_us(uart->bit_time * 6);
+    send_frame(uarts + uart_no, (uint8_t)c);
 
     return true;
 }

@@ -37,4 +37,23 @@ config SOFTUART_RX_BUFFER_SIZE
     default 128 if SOFTUART_RX_BUFFER_SIZE_128
     default 256 if SOFTUART_RX_BUFFER_SIZE_256
 
+config SOFTUART_TX_EXTRA_IDLE_BITS
+    int "Extra idle time after each transmitted byte (bit times)"
+    range 0 10
+    default 0
+    help
+        Idle time added after the stop bit of every transmitted byte. 0
+        sends frames back to back with one stop bit (standard 8N1). Use 1
+        for receivers that expect two stop bits, or 5 to reproduce the
+        fixed gap of earlier versions of this library.
+
+config SOFTUART_TX_CRITICAL_SECTION
+    bool "Disable interrupts while a byte is transmitted"
+    default n
+    help
+        Keeps other interrupts (Wi-Fi, timers, other GPIOs) from stretching
+        transmitted bits, at the cost of delaying them for up to one frame
+        (about 1 ms at 9600 baud). Received bytes on other software UART
+        ports cannot be sampled during that time either.
+
 endmenu

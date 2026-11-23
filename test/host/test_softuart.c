@@ -19,6 +19,12 @@
 #define TX1 13
 #define LATENCY_NS 3000 /* start-bit edge to handler entry */
 
+/* Mirrors the library's defaults for options not set on the command line. */
+#ifndef CONFIG_SOFTUART_TX_EXTRA_IDLE_BITS
+#define CONFIG_SOFTUART_TX_EXTRA_IDLE_BITS 0
+#endif
+#define RX_CHUNK (SOFTUART_MAX_RX_BUFF - 1 < 32 ? SOFTUART_MAX_RX_BUFF - 1 : 32)
+
 static int failures;
 static int checks;
 static const char *current_test;
@@ -42,6 +48,8 @@ typedef struct {
     int framing_errors;
     int glitches;
     double worst_edge_error_ns; /* distance of an edge from its ideal bit boundary */
+    double min_spacing_bits;    /* shortest start-to-start distance, in bits */
+    double max_spacing_bits;    /* longest start-to-start distance, in bits */
 } decoded_t;
 
 static int level_at(const sim_edge_t *e, size_t n, uint64_t t, int before_first)
@@ -67,11 +75,19 @@ static decoded_t decode_tx(int pin, uint32_t baud, bool invert)
     }
 
     size_t i = 0;
+    uint64_t prev_t0 = 0;
+    d.min_spacing_bits = 1e9;
     while (i < n) {
         /* find the next start bit: transition away from idle */
         while (i < n && e[i].level == idle) i++;
         if (i >= n) break;
         uint64_t t0 = e[i].t_ns;
+        if (d.n > 0) {
+            double spacing = (double)(t0 - prev_t0) / bit;
+            if (spacing < d.min_spacing_bits) d.min_spacing_bits = spacing;
+            if (spacing > d.max_spacing_bits) d.max_spacing_bits = spacing;
+        }
+        prev_t0 = t0;
         uint8_t byte = 0;
         for (int b = 0; b < 8; b++) {
             int l = level_at(e, n, (uint64_t)(t0 + (b + 1.5) * bit), idle);
@@ -110,9 +126,11 @@ static size_t drain(uint8_t uart, uint8_t *out, size_t max)
 
 /* ------------------------------------------------------------- tests */
 
-static void check_tx_n(const char *name, uint32_t baud, bool invert, uint32_t start_us, size_t count)
+static void check_tx_cpu(const char *name, uint32_t baud, bool invert, uint32_t start_us, size_t count,
+                         uint32_t cpu_hz)
 {
     begin(name, start_us);
+    if (cpu_hz) sim_set_cpu_hz(cpu_hz);
     CHECK(softuart_open(0, baud, RX0, TX0, invert), "open failed");
     CHECK(sim_output_level(TX0) == (invert ? 0 : 1), "TX does not idle at the %s level",
           invert ? "low" : "high");
@@ -138,6 +156,25 @@ static void check_tx_n(const char *name, uint32_t baud, bool invert, uint32_t st
     CHECK(d.worst_edge_error_ns < 0.05 * bit, "edge off its bit boundary by %.0f ns (%.1f%% of a bit)",
           d.worst_edge_error_ns, 100 * d.worst_edge_error_ns / bit);
     CHECK(sim_output_level(TX0) == (invert ? 0 : 1), "TX not back at idle after sending");
+    /* back-to-back frames: start bit, 8 data bits, stop bit, configured idle */
+    if (d.n > 1) {
+        const double expected = 10 + CONFIG_SOFTUART_TX_EXTRA_IDLE_BITS;
+        CHECK(d.min_spacing_bits > expected - 0.05 && d.max_spacing_bits < expected + 0.1,
+              "frames start %.2f to %.2f bits apart, expected %.0f", d.min_spacing_bits,
+              d.max_spacing_bits, expected);
+    }
+    CHECK(sim_critical_depth() == 0, "left a critical section open");
+#ifdef CONFIG_SOFTUART_TX_CRITICAL_SECTION
+    CHECK(sim_critical_entries() == (int)count, "%d critical sections for %zu bytes",
+          sim_critical_entries(), count);
+#else
+    CHECK(sim_critical_entries() == 0, "entered a critical section although the option is off");
+#endif
+}
+
+static void check_tx_n(const char *name, uint32_t baud, bool invert, uint32_t start_us, size_t count)
+{
+    check_tx_cpu(name, baud, invert, start_us, count, 0);
 }
 
 static void check_tx(const char *name, uint32_t baud, bool invert, uint32_t start_us)
@@ -153,10 +190,11 @@ static void test_tx(void)
     check_tx("tx 38400 8N1 inverted", 38400, true, 1000);
 }
 
-static void check_rx_n(const char *name, uint32_t baud, bool invert, uint32_t start_us, double gap_bits,
-                       int count)
+static void check_rx_full(const char *name, uint32_t baud, bool invert, uint32_t start_us,
+                          double gap_bits, int count, uint32_t cpu_hz, uint64_t latency_ns)
 {
     begin(name, start_us);
+    if (cpu_hz) sim_set_cpu_hz(cpu_hz);
     sim_set_idle_level(RX0, invert ? 0 : 1);
     CHECK(softuart_open(0, baud, RX0, TX0, invert), "open failed");
     CHECK(sim_intr_type(RX0) == (invert ? GPIO_INTR_POSEDGE : GPIO_INTR_NEGEDGE),
@@ -166,14 +204,14 @@ static void check_rx_n(const char *name, uint32_t baud, bool invert, uint32_t st
     uint8_t got[256];
     size_t n_got = 0;
     /* the bytes 0, 1, 2, ... in chunks that fit the ring buffer */
-    for (int chunk = 0; chunk < count; chunk += 32) {
-        int n = count - chunk < 32 ? count - chunk : 32;
+    for (int chunk = 0; chunk < count; chunk += RX_CHUNK) {
+        int n = count - chunk < RX_CHUNK ? count - chunk : RX_CHUNK;
         uint64_t t = sim_now_ns() + 50000;
         for (int i = 0; i < n; i++) {
             sim_queue_frame(RX0, t, (uint8_t)(chunk + i), baud, invert);
             t += (uint64_t)((10 + gap_bits) * bit);
         }
-        int fired = sim_deliver_frames(RX0, LATENCY_NS);
+        int fired = sim_deliver_frames(RX0, latency_ns);
         CHECK(fired == n, "ISR ran %d times for %d frames", fired, n);
         n_got += drain(0, got + n_got, sizeof(got) - n_got);
     }
@@ -183,6 +221,12 @@ static void check_rx_n(const char *name, uint32_t baud, bool invert, uint32_t st
         if (got[i] != (uint8_t)i && mismatches++ == 0) first = i;
     CHECK(mismatches == 0, "%zu bytes wrong (first: expected 0x%02zx, got 0x%02x)", mismatches,
           first, got[first]);
+}
+
+static void check_rx_n(const char *name, uint32_t baud, bool invert, uint32_t start_us, double gap_bits,
+                       int count)
+{
+    check_rx_full(name, baud, invert, start_us, gap_bits, count, 0, LATENCY_NS);
 }
 
 static void check_rx(const char *name, uint32_t baud, bool invert, uint32_t start_us, double gap_bits)
@@ -197,6 +241,30 @@ static void test_rx(void)
     check_rx("rx 38400 8N1", 38400, false, 1000, 2);
     check_rx("rx 9600 8N1 inverted", 9600, true, 1000, 2);
     check_rx("rx 38400 8N1 inverted back-to-back", 38400, true, 1000, 0);
+}
+
+static void test_high_baud(void)
+{
+    /*
+     * Bit periods that are not a whole number of microseconds must not drift:
+     * 74880 baud is 13.35 us per bit, 115200 is 8.68 us, 230400 is 4.34 us.
+     */
+    check_tx("tx 74880 8N1", 74880, false, 1000);
+    check_tx("tx 115200 8N1", 115200, false, 1000);
+    check_tx("tx 115200 8N1 inverted", 115200, true, 1000);
+    check_tx_n("tx 230400 8N1", 230400, false, 1000, 64);
+    check_rx_full("rx 74880 8N1", 74880, false, 1000, 1, 256, 0, 500);
+    check_rx_full("rx 115200 8N1", 115200, false, 1000, 1, 256, 0, 500);
+    check_rx_full("rx 230400 8N1", 230400, false, 1000, 1, 256, 0, 500);
+    check_rx_full("rx 230400 8N1 inverted", 230400, true, 1000, 1, 256, 0, 500);
+}
+
+static void test_cpu_80mhz(void)
+{
+    check_tx_cpu("tx 9600 8N1 at 80 MHz", 9600, false, 1000, 64, 80000000);
+    check_tx_cpu("tx 115200 8N1 at 80 MHz", 115200, false, 1000, 64, 80000000);
+    check_rx_full("rx 9600 8N1 at 80 MHz", 9600, false, 1000, 1, 64, 80000000, LATENCY_NS);
+    check_rx_full("rx 115200 8N1 at 80 MHz", 115200, false, 1000, 1, 64, 80000000, 500);
 }
 
 static void test_low_baud(void)
@@ -342,6 +410,8 @@ int main(void)
 {
     test_tx();
     test_rx();
+    test_high_baud();
+    test_cpu_80mhz();
     test_low_baud();
     test_timer_wrap();
     test_rx_buffer_full();

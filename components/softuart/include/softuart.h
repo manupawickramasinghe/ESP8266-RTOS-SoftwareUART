@@ -52,7 +52,8 @@ extern "C"
 /**
  * Initialize software uart and setup interrupt handler.
  * Opening a port that is already open reconfigures it; the receive buffer
- * is emptied either way.
+ * is emptied either way. The bit period is derived from the CPU clock at
+ * this point, so open the port again after changing the CPU frequency.
  * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS-1
  * @param baudrate Baudrate, e.g. 9600, 19200, etc (1..1000000)
  * @param rx_pin GPIO pin number for RX, GPIO0-15 (GPIO16 has no interrupt)
@@ -71,7 +72,8 @@ bool softuart_open(uint8_t uart_no, uint32_t baudrate, uint32_t rx_pin, uint32_t
 bool softuart_close(uint8_t uart_no);
 
 /**
- * Put char to software uart
+ * Put char to software uart. Blocks until the stop bit (plus any idle time
+ * configured with CONFIG_SOFTUART_TX_EXTRA_IDLE_BITS) has been sent.
  * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS-1
  * @param c Char
  * @return true if no errors occured otherwise false

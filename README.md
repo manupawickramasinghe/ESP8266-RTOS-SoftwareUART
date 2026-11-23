@@ -33,7 +33,10 @@ transceivers and other low-speed serial peripherals.
 ## Features
 
 - Up to `SOFTUART_MAX_UARTS` independent ports (2 by default).
-- 8 data bits, no parity, 1 stop bit (8N1).
+- 8 data bits, no parity, 1 stop bit (8N1), with optional extra idle
+  time after each transmitted byte.
+- Bit timing from the CPU cycle counter: every bit edge lands within one
+  CPU cycle of its exact position at any baud rate, with no drift.
 - Optional inverted line logic, for links that idle low.
 - Interrupt-driven receive into a per-port ring buffer (64 bytes by default).
 - Blocking transmit of single bytes, C strings or byte buffers.
@@ -49,16 +52,26 @@ transceivers and other low-speed serial peripherals.
       1 bit  ◄─────── 8 data bits, LSB first ───────► 1 bit
 ```
 
-**Receive.** The RX pin has an edge interrupt that fires on the falling
-edge of the start bit (rising edge when inverted). The handler waits half a
-bit time, then samples the 8 data bits in the middle of each bit period.
-It pushes the byte into the port's ring buffer, waits for the stop bit and
-re-arms the interrupt. `softuart_available()` and `softuart_read()` drain
-the buffer from task context.
+**Timing.** When a port is opened, the bit period is converted to CPU
+cycles (`cpu_hz / baud`), keeping the remainder. Bit boundaries are
+measured from the start of the frame on the CPU cycle counter (`CCOUNT`).
+The remainder is carried from bit to bit, so even rates that are not a
+whole number of microseconds (13.35 µs per bit at 74880 baud, 8.68 µs at
+115200) do not drift.
 
-**Transmit.** `softuart_put()` drives the TX pin from the calling task. Each
-bit edge is timed against the SDK's microsecond system timer, measured from
-the start of the frame, so timing errors do not accumulate across a byte.
+**Receive.** The RX pin has an edge interrupt that fires on the falling
+edge of the start bit (rising edge when inverted). The handler samples the
+8 data bits in the middle of each bit period, 1.5 to 8.5 bit periods after
+the edge. It pushes the byte into the port's ring buffer, waits for the
+middle of the stop bit and re-arms the interrupt. `softuart_available()`
+and `softuart_read()` drain the buffer from task context.
+
+**Transmit.** `softuart_put()` drives the TX pin from the calling task and
+returns after the stop bit plus any configured idle time.
+
+The interrupt handler and the transmit loop run from IRAM and access the
+GPIO registers directly, so a flash-cache miss cannot delay a sample or
+an edge.
 
 ## Hardware
 
@@ -246,6 +259,13 @@ two from 2 to 256, which is checked at compile time.
 The example application has its own **Software UART example** menu with
 the RX and TX GPIOs, the baud rate and line inversion.
 
+Two more options tune transmission:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `CONFIG_SOFTUART_TX_EXTRA_IDLE_BITS` | `0` | Idle time after each transmitted stop bit, in bit times (0 – 10). Use `1` for receivers that need two stop bits. Versions before this option always left about 5 extra bit times; set `5` to reproduce that. |
+| `CONFIG_SOFTUART_TX_CRITICAL_SECTION` | off | Disable interrupts while a frame is sent, so Wi-Fi or timer interrupts cannot stretch a bit. Other interrupts, including reception on other ports, then wait for up to one frame (about 1 ms at 9600 baud). |
+
 The library logs configuration errors, such as an invalid pin or baud
 rate passed to `softuart_open()`, through `ESP_LOGE` with the tag
 `softuart`. It never logs from the interrupt handler.
@@ -256,18 +276,20 @@ A software UART uses the CPU to time every bit, and that has costs:
 
 - **The CPU is busy for every byte.** Receiving a byte holds the CPU in the
   GPIO interrupt for about 9.5 bit times (≈ 1 ms at 9600 baud).
-  Transmitting busy-waits in the calling task for the length of the frame
-  plus some idle time.
+  Transmitting busy-waits in the calling task for the 10-bit frame plus
+  any configured idle time.
 - **In practice the link is half-duplex.** A byte arriving while
   `softuart_put()` is running interrupts the transmitter and distorts the
   outgoing bits. Two ports also cannot receive at the same moment.
-- **Interrupt latency limits the speed.** Wi-Fi and other interrupts can
-  delay the start-bit interrupt or stretch a transmitted bit. 9600 baud is
-  the proven use case (a GPS module, by the original authors).
-  Reliability drops as the baud rate rises.
-- **Bit timing has 1 µs resolution.** The bit time is rounded to a whole
-  microsecond, which adds a rate error at high baud rates (for example
-  13 µs instead of 13.35 µs at 74880 baud).
+- **Interrupt latency limits the speed.** The receiver measures from the
+  moment its handler starts, which is a few microseconds after the
+  start-bit edge. Wi-Fi and other interrupts can delay it further, or
+  stretch a transmitted bit (see `CONFIG_SOFTUART_TX_CRITICAL_SECTION`).
+  The timing arithmetic is verified in simulation up to 230400 baud.
+  On hardware, 9600 baud is the proven use case (a GPS module, by the
+  original authors), and margins shrink as the baud rate rises.
+- **The CPU clock is read when a port opens.** Call `softuart_open()`
+  again after changing the CPU frequency at run time.
 - **Only 8N1.** There is no parity, no 2-stop-bit mode and no flow control.
 - **A received NUL byte looks like "no data".** `softuart_read()` returns
   `0` for both, so check `softuart_available()` first.
@@ -302,15 +324,23 @@ UART for slow peripherals.
 for the build machine against a small ESP8266 simulator. The simulator models virtual
 time, GPIO levels and the GPIO ISR service. The tests cover:
 
-- **Transmit.** Every byte value at 9600 and 38400 baud, normal and
-  inverted, decoded from the generated waveform. Every bit edge must sit
-  within 5 % of a bit of its ideal position, with no glitches.
-- **Receive.** Every byte value, including back-to-back frames, delivered
-  through the interrupt handler with simulated interrupt latency.
+- **Transmit.** Every byte value from 9600 to 115200 baud (and 230400),
+  normal and inverted, decoded from the generated waveform. Every bit edge
+  must sit within 5 % of a bit of its ideal position, with no glitches.
+  Frames must start exactly 10 bits apart (plus the configured idle time).
+- **Receive.** Every byte value from 9600 to 230400 baud, including
+  back-to-back frames, delivered through the interrupt handler with
+  simulated interrupt latency.
+- **CPU clock.** Transmit and receive with the CPU at 80 MHz as well as
+  160 MHz.
 - **Timer wrap.** Frames in flight while the 32-bit microsecond timer
   crosses 2³¹ and wraps at 2³².
 - **Lifecycle.** Opening, re-opening and closing ports, input validation,
   ring-buffer overflow, and GPIO ISR service ownership.
+
+The suite runs twice: once with the default configuration, and once with
+3 ports, a 16-byte buffer, 5 extra idle bits and the transmit critical
+section enabled.
 
 ```sh
 make -C test/host      # needs only a C11 compiler; runs with ASan and UBSan

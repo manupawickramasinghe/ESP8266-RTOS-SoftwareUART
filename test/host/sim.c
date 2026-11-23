@@ -8,12 +8,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "driver/soc.h"
+#include "esp8266/gpio_struct.h"
+#include "esp_clk.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
 #include "rom/ets_sys.h"
 
-/* Virtual cost of SDK calls, roughly what they take at 160 MHz. */
+/* Virtual cost of SDK calls and register accesses, roughly at 160 MHz. */
 #define COST_GET_TIME_NS 250
 #define COST_GPIO_NS 100
+#define COST_CCOUNT_NS 25
+#define COST_REG_NS 25
 
 typedef struct {
     uint64_t start_ns;
@@ -38,21 +44,44 @@ typedef struct {
 
 static uint64_t now_ns;
 static uint32_t base_us;
+static uint32_t cpu_hz = 160000000;
+static uint32_t ccount_base;
 static int log_counts[ESP_LOG_VERBOSE + 1];
 static bool isr_service;
+static int critical_depth;
+static int critical_entries;
 static sim_pin_t pins[GPIO_PIN_COUNT];
+
+/* Register-level view of GPIO0-15 (see mocks/esp8266/gpio_struct.h). */
+static gpio_struct_t regs;
+static uint64_t last_reg_access_ns;
 
 void sim_reset(uint32_t start_us)
 {
     now_ns = 0;
     base_us = start_us;
+    cpu_hz = 160000000;
+    /* the cycle counter wraps at the same instant as start_us * MHz would */
+    ccount_base = start_us * (cpu_hz / 1000000);
     memset(log_counts, 0, sizeof(log_counts));
     isr_service = false;
+    critical_depth = 0;
+    critical_entries = 0;
+    memset(&regs, 0, sizeof(regs));
+    last_reg_access_ns = 0;
     memset(pins, 0, sizeof(pins));
     for (int i = 0; i < GPIO_PIN_COUNT; i++) {
         pins[i].out_level = -1;
         pins[i].idle_level = 1;
     }
+}
+
+void sim_set_cpu_hz(uint32_t hz)
+{
+    /* keep the counter continuous across the change */
+    uint32_t now = soc_get_ccount();
+    cpu_hz = hz;
+    ccount_base = now - (uint32_t)(now_ns * (cpu_hz / 1000000) / 1000);
 }
 
 uint64_t sim_now_ns(void) { return now_ns; }
@@ -90,6 +119,76 @@ void sim_log(esp_log_level_t level, const char *tag, const char *fmt, ...)
 
 int sim_log_count(int level) { return log_counts[level]; }
 
+uint32_t soc_get_ccount(void)
+{
+    now_ns += COST_CCOUNT_NS;
+    return ccount_base + (uint32_t)(now_ns * (cpu_hz / 1000000) / 1000);
+}
+
+int esp_clk_cpu_freq(void) { return (int)cpu_hz; }
+
+void sim_enter_critical(void)
+{
+    critical_depth++;
+    critical_entries++;
+}
+
+void sim_exit_critical(void)
+{
+    if (critical_depth <= 0) {
+        fprintf(stderr, "sim: portEXIT_CRITICAL without portENTER_CRITICAL\n");
+        abort();
+    }
+    critical_depth--;
+}
+
+int sim_critical_depth(void) { return critical_depth; }
+int sim_critical_entries(void) { return critical_entries; }
+
+static void record_level(sim_pin_t *p, int pin, int level, uint64_t t)
+{
+    if (level == p->out_level) return;
+    if (p->n_edges >= SIM_MAX_EDGES) {
+        fprintf(stderr, "sim: edge buffer full on pin %d\n", pin);
+        abort();
+    }
+    p->edges[p->n_edges++] = (sim_edge_t){ t, level };
+    p->out_level = level;
+}
+
+static int input_level_at(const sim_pin_t *p, uint64_t t);
+
+/*
+ * Apply register writes made since the previous GPIO access. A write
+ * happens right after the access that produced the pointer, so it takes
+ * that access's timestamp.
+ */
+static void sync_regs(void)
+{
+    for (int i = 0; i < 16; i++) {
+        if (regs.out_w1ts & (1u << i)) record_level(&pins[i], i, 1, last_reg_access_ns);
+        if (regs.out_w1tc & (1u << i)) record_level(&pins[i], i, 0, last_reg_access_ns);
+        if ((gpio_int_type_t)regs.pin[i].int_type != pins[i].intr_type) {
+            pins[i].intr_type = (gpio_int_type_t)regs.pin[i].int_type;
+            pins[i].armed_ns = last_reg_access_ns;
+        }
+    }
+    regs.out_w1ts = 0;
+    regs.out_w1tc = 0;
+}
+
+volatile gpio_struct_t *sim_gpio_regs(void)
+{
+    sync_regs();
+    now_ns += COST_REG_NS;
+    last_reg_access_ns = now_ns;
+    uint32_t in = 0;
+    for (int i = 0; i < 16; i++)
+        if (input_level_at(&pins[i], now_ns)) in |= 1u << i;
+    regs.in = in;
+    return &regs;
+}
+
 uint32_t esp_get_time(void)
 {
     now_ns += COST_GET_TIME_NS;
@@ -101,10 +200,14 @@ void os_delay_us(uint16_t us) { now_ns += (uint64_t)us * 1000; }
 
 esp_err_t gpio_config(const gpio_config_t *cfg)
 {
+    sync_regs();
     for (int i = 0; i < GPIO_PIN_COUNT; i++) {
         if (!(cfg->pin_bit_mask & (1u << i))) continue;
         pins[i].mode = cfg->mode;
-        if (i != 16) pins[i].intr_type = cfg->intr_type;
+        if (i != 16) {
+            pins[i].intr_type = cfg->intr_type;
+            regs.pin[i].int_type = cfg->intr_type;
+        }
     }
     return ESP_OK;
 }
@@ -113,16 +216,9 @@ esp_err_t gpio_set_level(gpio_num_t gpio_num, uint32_t level)
 {
     if (!GPIO_IS_VALID_GPIO(gpio_num)) return ESP_ERR_INVALID_ARG;
     sim_pin_t *p = pin_or_die(gpio_num);
-    int l = level ? 1 : 0;
+    sync_regs();
     now_ns += COST_GPIO_NS;
-    if (l != p->out_level) {
-        if (p->n_edges >= SIM_MAX_EDGES) {
-            fprintf(stderr, "sim: edge buffer full on pin %d\n", gpio_num);
-            abort();
-        }
-        p->edges[p->n_edges++] = (sim_edge_t){ now_ns, l };
-        p->out_level = l;
-    }
+    record_level(p, gpio_num, level ? 1 : 0, now_ns);
     return ESP_OK;
 }
 
@@ -165,9 +261,11 @@ esp_err_t gpio_set_intr_type(gpio_num_t gpio_num, gpio_int_type_t intr_type)
     if (!GPIO_IS_VALID_GPIO(gpio_num) || RTC_GPIO_IS_VALID_GPIO(gpio_num)) return ESP_ERR_INVALID_ARG;
     if (intr_type >= GPIO_INTR_MAX) return ESP_ERR_INVALID_ARG;
     sim_pin_t *p = pin_or_die(gpio_num);
+    sync_regs();
     now_ns += COST_GPIO_NS;
     p->intr_type = intr_type;
     p->armed_ns = now_ns;
+    regs.pin[gpio_num].int_type = intr_type;
     return ESP_OK;
 }
 
@@ -214,12 +312,17 @@ esp_err_t gpio_isr_handler_remove(gpio_num_t gpio_num)
 
 size_t sim_edges(int pin, const sim_edge_t **edges)
 {
+    sync_regs();
     sim_pin_t *p = pin_or_die(pin);
     *edges = p->edges;
     return p->n_edges;
 }
 
-int sim_output_level(int pin) { return pin_or_die(pin)->out_level; }
+int sim_output_level(int pin)
+{
+    sync_regs();
+    return pin_or_die(pin)->out_level;
+}
 void sim_clear_edges(int pin) { pin_or_die(pin)->n_edges = 0; }
 void sim_set_idle_level(int pin, int level) { pin_or_die(pin)->idle_level = level ? 1 : 0; }
 
@@ -266,6 +369,7 @@ int sim_deliver_frames(int pin, uint64_t latency_ns)
 {
     sim_pin_t *p = pin_or_die(pin);
     if (p->n_frames == 0) return 0;
+    sync_regs();
 
     sim_edge_t *tr = calloc(p->n_frames * 11 + 1, sizeof(*tr));
     if (!tr) abort();
@@ -285,6 +389,7 @@ int sim_deliver_frames(int pin, uint64_t latency_ns)
         sim_advance_to_ns(edge + latency_ns);
         if (!isr_service || !p->handler) break;
         p->handler(p->handler_arg);
+        sync_regs();
         fired++;
         search_from = now_ns;
     }
@@ -296,5 +401,9 @@ int sim_deliver_frames(int pin, uint64_t latency_ns)
 
 bool sim_isr_service_installed(void) { return isr_service; }
 bool sim_isr_handler_registered(int pin) { return pin_or_die(pin)->handler != NULL; }
-gpio_int_type_t sim_intr_type(int pin) { return pin_or_die(pin)->intr_type; }
+gpio_int_type_t sim_intr_type(int pin)
+{
+    sync_regs();
+    return pin_or_die(pin)->intr_type;
+}
 gpio_mode_t sim_pin_mode(int pin) { return pin_or_die(pin)->mode; }
