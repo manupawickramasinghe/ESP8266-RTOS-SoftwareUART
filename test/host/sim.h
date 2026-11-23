@@ -58,6 +58,15 @@ int sim_log_count(int level);
 int sim_critical_depth(void);   /* current portENTER_CRITICAL nesting */
 int sim_critical_entries(void); /* portENTER_CRITICAL calls since sim_reset() */
 
+/* --- scheduler ------------------------------------------------------------ */
+/*
+ * Called from vTaskDelay() with the wake-up time, before time advances to it:
+ * lets a test deliver frames that arrive while a task sleeps.
+ */
+typedef void (*sim_delay_hook_t)(uint64_t wake_ns);
+void sim_set_delay_hook(sim_delay_hook_t hook);
+int sim_delay_calls(void); /* vTaskDelay() calls since sim_reset() */
+
 /* --- interrupt controller --------------------------------------------- */
 bool sim_isr_service_installed(void);
 bool sim_isr_handler_registered(int pin);

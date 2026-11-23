@@ -379,6 +379,137 @@ static void test_reopen_discards_stale_bytes(void)
     CHECK(!softuart_available(0), "stale byte from before the re-open is still buffered");
 }
 
+static void test_read_byte_distinguishes_nul(void)
+{
+    begin("read_byte tells a received 0x00 from an empty buffer", 1000);
+    CHECK(softuart_open(0, 9600, RX0, TX0, false), "open failed");
+    uint8_t b = 0xee;
+    CHECK(!softuart_read_byte(0, &b), "read_byte succeeded on an empty buffer");
+    CHECK(b == 0xee, "read_byte wrote to the output on an empty buffer");
+    sim_queue_frame(RX0, sim_now_ns() + 50000, 0x00, 9600, false);
+    sim_deliver_frames(RX0, LATENCY_NS);
+    CHECK(softuart_rx_count(0) == 1, "rx_count is %zu, expected 1", softuart_rx_count(0));
+    CHECK(softuart_read_byte(0, &b) && b == 0x00, "did not read the 0x00 byte");
+    CHECK(softuart_rx_count(0) == 0, "rx_count not 0 after reading");
+    CHECK(!softuart_read_byte(0, NULL), "read_byte accepted a NULL output");
+    CHECK(!softuart_read_byte(1, &b), "read_byte succeeded on a closed port");
+}
+
+static void test_rx_count_flush_overflow(void)
+{
+    begin("rx_count, rx_flush and rx_overflow", 1000);
+    CHECK(softuart_open(0, 9600, RX0, TX0, false), "open failed");
+    CHECK(!softuart_rx_overflow(0), "overflow flag set on a fresh port");
+    const double bit = 1e9 / 9600;
+    uint64_t t = sim_now_ns() + 50000;
+    for (int i = 0; i < 5; i++) {
+        sim_queue_frame(RX0, t, (uint8_t)('a' + i), 9600, false);
+        t += (uint64_t)(12 * bit);
+    }
+    sim_deliver_frames(RX0, LATENCY_NS);
+    CHECK(softuart_rx_count(0) == 5, "rx_count is %zu, expected 5", softuart_rx_count(0));
+    CHECK(!softuart_rx_overflow(0), "overflow flag set without an overflow");
+    CHECK(softuart_rx_flush(0), "rx_flush failed");
+    CHECK(softuart_rx_count(0) == 0 && !softuart_available(0), "buffer not empty after rx_flush");
+
+    t = sim_now_ns() + 50000;
+    for (int i = 0; i < SOFTUART_MAX_RX_BUFF + 2; i++) {
+        sim_queue_frame(RX0, t, (uint8_t)i, 9600, false);
+        t += (uint64_t)(12 * bit);
+    }
+    sim_deliver_frames(RX0, LATENCY_NS);
+    CHECK(softuart_rx_count(0) == SOFTUART_MAX_RX_BUFF - 1, "rx_count is %zu, expected %d",
+          softuart_rx_count(0), SOFTUART_MAX_RX_BUFF - 1);
+    CHECK(softuart_rx_overflow(0), "overflow not reported");
+    CHECK(!softuart_rx_overflow(0), "overflow flag not cleared by reading it");
+    CHECK(sim_critical_depth() == 0, "left a critical section open");
+    CHECK(!softuart_rx_flush(1) && !softuart_rx_overflow(1) && softuart_rx_count(1) == 0,
+          "closed port accepted rx_flush/rx_overflow/rx_count");
+}
+
+static int hook_frames_left;
+static uint64_t hook_first_wake_ns;
+
+/* Deliver one frame per tick while softuart_read_bytes() sleeps. */
+static void deliver_one_frame_per_tick(uint64_t wake_ns)
+{
+    if (!hook_first_wake_ns) hook_first_wake_ns = wake_ns;
+    if (hook_frames_left <= 0) return;
+    sim_queue_frame(RX0, sim_now_ns() + 1000, (uint8_t)('0' + hook_frames_left), 9600, false);
+    sim_deliver_frames(RX0, LATENCY_NS);
+    hook_frames_left--;
+}
+
+static void test_read_bytes(void)
+{
+    uint8_t buf[16];
+    begin("read_bytes returns buffered data without waiting", 1000);
+    CHECK(softuart_open(0, 9600, RX0, TX0, false), "open failed");
+    const double bit = 1e9 / 9600;
+    uint64_t t = sim_now_ns() + 50000;
+    for (int i = 0; i < 4; i++) {
+        sim_queue_frame(RX0, t, (uint8_t)('w' + i), 9600, false);
+        t += (uint64_t)(12 * bit);
+    }
+    sim_deliver_frames(RX0, LATENCY_NS);
+    CHECK(softuart_read_bytes(0, buf, 4, 1000) == 4 && memcmp(buf, "wxyz", 4) == 0,
+          "did not read the 4 buffered bytes");
+    CHECK(sim_delay_calls() == 0, "slept although the data was already there");
+
+    begin("read_bytes with timeout 0 does not block", 1000);
+    CHECK(softuart_open(0, 9600, RX0, TX0, false), "open failed");
+    CHECK(softuart_read_bytes(0, buf, sizeof(buf), 0) == 0, "read data from an empty buffer");
+    CHECK(sim_delay_calls() == 0, "slept with a zero timeout");
+
+    begin("read_bytes gives up after the timeout", 1000);
+    CHECK(softuart_open(0, 9600, RX0, TX0, false), "open failed");
+    uint64_t t0 = sim_now_ns();
+    CHECK(softuart_read_bytes(0, buf, sizeof(buf), 55) == 0, "read data that never arrived");
+    double waited_ms = (double)(sim_now_ns() - t0) / 1e6;
+    CHECK(waited_ms >= 55 && waited_ms <= 75, "waited %.1f ms for a 55 ms timeout", waited_ms);
+
+    begin("read_bytes collects bytes that arrive while it waits", 1000);
+    CHECK(softuart_open(0, 9600, RX0, TX0, false), "open failed");
+    hook_frames_left = 3;
+    hook_first_wake_ns = 0;
+    sim_set_delay_hook(deliver_one_frame_per_tick);
+    size_t n = softuart_read_bytes(0, buf, 3, SOFTUART_WAIT_FOREVER);
+    CHECK(n == 3 && memcmp(buf, "321", 3) == 0, "read %zu bytes while waiting", n);
+    CHECK(sim_delay_calls() == 3, "slept %d times for 3 bytes arriving one per tick", sim_delay_calls());
+
+    begin("read_bytes rejects invalid arguments", 1000);
+    CHECK(softuart_read_bytes(0, buf, sizeof(buf), 0) == 0, "read from a closed port");
+    CHECK(softuart_open(0, 9600, RX0, TX0, false), "open failed");
+    CHECK(softuart_read_bytes(0, NULL, 4, 0) == 0, "accepted a NULL buffer");
+    CHECK(softuart_read_bytes(SOFTUART_MAX_UARTS, buf, 4, 0) == 0, "accepted an invalid port");
+}
+
+static void test_printf(void)
+{
+    begin("printf formats and transmits", 1000);
+    CHECK(softuart_open(0, 38400, RX0, TX0, false), "open failed");
+    sim_clear_edges(TX0);
+    int n = softuart_printf(0, "x=%d %s", 42, "ok");
+    CHECK(n == 7, "printf returned %d, expected 7", n);
+    decoded_t d = decode_tx(TX0, 38400, false);
+    CHECK(d.n == 7 && memcmp(d.bytes, "x=42 ok", 7) == 0, "line carried %zu bytes: %.*s", d.n,
+          (int)d.n, (const char *)d.bytes);
+
+    begin("printf longer than the stack buffer", 1000);
+    CHECK(softuart_open(0, 115200, RX0, TX0, false), "open failed");
+    sim_clear_edges(TX0);
+    char expected[301];
+    memset(expected, 'A', 300);
+    expected[300] = '\0';
+    n = softuart_printf(0, "%s", expected);
+    CHECK(n == 300, "printf returned %d, expected 300", n);
+    d = decode_tx(TX0, 115200, false);
+    CHECK(d.n == 300 && memcmp(d.bytes, expected, 300) == 0, "long output decoded as %zu bytes", d.n);
+
+    CHECK(softuart_printf(1, "closed") == -1, "printf succeeded on a closed port");
+    CHECK(softuart_printf(0, NULL) == -1, "printf accepted a NULL format");
+}
+
 static void test_open_validation(void)
 {
     begin("open rejects invalid arguments", 1000);
@@ -419,6 +550,10 @@ int main(void)
     test_close_keeps_application_isr_service();
     test_reopen();
     test_reopen_discards_stale_bytes();
+    test_read_byte_distinguishes_nul();
+    test_rx_count_flush_overflow();
+    test_read_bytes();
+    test_printf();
     test_open_validation();
 
     printf("%d checks, %d failed\n", checks, failures);
