@@ -1,0 +1,40 @@
+menu "Software UART (softuart)"
+
+config SOFTUART_MAX_UARTS
+    int "Number of software UART ports"
+    range 1 8
+    default 2
+    help
+        How many independent software UART ports softuart_open() accepts
+        (port numbers 0 to this value minus one). Each port uses about
+        16 bytes of RAM plus its receive buffer.
+
+choice SOFTUART_RX_BUFFER_SIZE_CHOICE
+    prompt "Receive buffer size per port"
+    default SOFTUART_RX_BUFFER_SIZE_64
+    help
+        Size of each port's receive ring buffer. One slot stays free, so a
+        port holds up to this many bytes minus one. When the buffer is
+        full, newly received bytes are dropped.
+
+    config SOFTUART_RX_BUFFER_SIZE_16
+        bool "16 bytes"
+    config SOFTUART_RX_BUFFER_SIZE_32
+        bool "32 bytes"
+    config SOFTUART_RX_BUFFER_SIZE_64
+        bool "64 bytes"
+    config SOFTUART_RX_BUFFER_SIZE_128
+        bool "128 bytes"
+    config SOFTUART_RX_BUFFER_SIZE_256
+        bool "256 bytes"
+endchoice
+
+config SOFTUART_RX_BUFFER_SIZE
+    int
+    default 16 if SOFTUART_RX_BUFFER_SIZE_16
+    default 32 if SOFTUART_RX_BUFFER_SIZE_32
+    default 64 if SOFTUART_RX_BUFFER_SIZE_64
+    default 128 if SOFTUART_RX_BUFFER_SIZE_128
+    default 256 if SOFTUART_RX_BUFFER_SIZE_256
+
+endmenu

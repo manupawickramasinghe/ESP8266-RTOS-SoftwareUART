@@ -37,6 +37,7 @@ transceivers and other low-speed serial peripherals.
 - Optional inverted line logic, for links that idle low.
 - Interrupt-driven receive into a per-port ring buffer (64 bytes by default).
 - Blocking transmit of single bytes, C strings or byte buffers.
+- Packaged as a reusable ESP-IDF component, configured through `menuconfig`.
 - Builds with both the legacy GNU Make and the CMake (`idf.py`) build systems.
 
 ## How it works
@@ -141,16 +142,50 @@ extracted folder.
 
 ### 3. Try it
 
-The example opens software UART 0 on RX = GPIO4, TX = GPIO5 at 74880 baud.
-It repeatedly sends `Hello from Soft UART!` and prints received bytes
-to the console. Connect a USB-serial adapter as shown under
-[Wiring](#wiring) and open it at 74880 8N1 (for example
-`picocom -b 74880 /dev/ttyUSB1`).
+By default the example opens software UART 0 on RX = GPIO4, TX = GPIO5
+at 9600 baud. To change the pins, baud rate or line inversion, run
+`idf.py menuconfig` (or `make menuconfig`) and open
+**Software UART example**.
+
+Connect a USB-serial adapter as shown under [Wiring](#wiring) and open
+it at 9600 8N1 (for example `picocom -b 9600 /dev/ttyUSB1`). You should
+see:
+
+```
+Hello from Soft UART! Type something and it is echoed back.
+[heartbeat 1]
+```
+
+Whatever you type is echoed back. Each completed line is also logged on
+the ESP8266 console:
+
+```
+I (12345) softuart-example: received: hello
+```
 
 ## Using the library
 
-Copy `main/softuart.c` and `main/softuart.h` into a component of your
-project, then:
+The library is the ESP-IDF component in `components/softuart`. Add it to
+your project in either of these ways:
+
+- Copy the `components/softuart` directory into your project's
+  `components/` directory.
+- Point your build at a checkout of this repository. In the project's
+  top-level `CMakeLists.txt`, before `include($ENV{IDF_PATH}/...)`:
+
+  ```cmake
+  set(EXTRA_COMPONENT_DIRS /path/to/ESP8266-RTOS-SoftwareUART/components)
+  ```
+
+  For legacy make, in the project `Makefile`:
+
+  ```make
+  EXTRA_COMPONENT_DIRS := /path/to/ESP8266-RTOS-SoftwareUART/components
+  ```
+
+The `main` component can use it right away. In CMake builds, any other
+component that includes `softuart.h` needs `REQUIRES softuart` (or
+`PRIV_REQUIRES softuart`) in its `idf_component_register()`. Then:
 
 ```c
 #include <stdio.h>
@@ -196,26 +231,24 @@ All functions take the port index `uart_no`, from `0` to
 
 ## Configuration
 
-Both limits are compile-time macros in `softuart.h` and can be overridden
-with compiler definitions:
+Run `idf.py menuconfig` (or `make menuconfig`) and open
+**Component config → Software UART (softuart)**:
 
-| Macro | Default | Meaning |
+| Option | Default | Meaning |
 |---|---|---|
-| `SOFTUART_MAX_UARTS` | `2` | Number of software UART ports |
-| `SOFTUART_MAX_RX_BUFF` | `64` | Receive ring-buffer size per port, in bytes. Must be a power of two from 2 to 256 (checked at compile time). One slot stays free, so a port holds up to `SOFTUART_MAX_RX_BUFF - 1` bytes. When the buffer is full, newer bytes are dropped. |
+| `CONFIG_SOFTUART_MAX_UARTS` | `2` | Number of software UART ports (1 – 8). The header exposes it as `SOFTUART_MAX_UARTS`. |
+| `CONFIG_SOFTUART_RX_BUFFER_SIZE` | `64` | Receive ring-buffer size per port: 16, 32, 64, 128 or 256 bytes. One slot stays free, so a port holds up to size − 1 bytes. When the buffer is full, newer bytes are dropped. The header exposes it as `SOFTUART_MAX_RX_BUFF`. |
 
-```cmake
-# CMake: in the component's CMakeLists.txt, after idf_component_register()
-target_compile_definitions(${COMPONENT_LIB} PRIVATE SOFTUART_MAX_RX_BUFF=128)
-```
+A compiler definition of `SOFTUART_MAX_UARTS` or `SOFTUART_MAX_RX_BUFF`
+still overrides the menuconfig value. The buffer size must be a power of
+two from 2 to 256, which is checked at compile time.
 
-```make
-# Legacy make: in the component's component.mk
-CFLAGS += -DSOFTUART_MAX_RX_BUFF=128
-```
+The example application has its own **Software UART example** menu with
+the RX and TX GPIOs, the baud rate and line inversion.
 
-`softuart.c` defines `SOFTUART_DEBUG`, which prints configuration errors
-(such as an invalid port number) with `printf`.
+The library logs configuration errors, such as an invalid pin or baud
+rate passed to `softuart_open()`, through `ESP_LOGE` with the tag
+`softuart`. It never logs from the interrupt handler.
 
 ## Limitations
 
@@ -247,11 +280,15 @@ UART for slow peripherals.
 
 ```
 .
-├── main/
-│   ├── softuart.c / .h        # the software UART library
-│   ├── hello_world_main.c     # example application
-│   ├── CMakeLists.txt         # component registration (CMake build)
-│   └── component.mk           # component makefile (legacy make build)
+├── components/softuart/       # the software UART library (ESP-IDF component)
+│   ├── include/softuart.h     # public API
+│   ├── softuart.c
+│   ├── Kconfig                # menuconfig options
+│   ├── CMakeLists.txt         # CMake build
+│   └── component.mk           # legacy make build
+├── main/                      # example application
+│   ├── softuart_example_main.c
+│   └── Kconfig.projbuild      # example pins, baud rate, inversion
 ├── test/host/                 # simulator-based unit tests (run on the build machine)
 ├── scripts/ci-build.sh        # build + stage firmware (used by CI)
 ├── sdkconfig.defaults         # project configuration defaults
@@ -261,8 +298,8 @@ UART for slow peripherals.
 
 ## Testing
 
-`test/host/` contains unit tests that compile `softuart.c` for the build
-machine against a small ESP8266 simulator. The simulator models virtual
+`test/host/` contains unit tests that compile `components/softuart/softuart.c`
+for the build machine against a small ESP8266 simulator. The simulator models virtual
 time, GPIO levels and the GPIO ISR service. The tests cover:
 
 - **Transmit.** Every byte value at 9600 and 38400 baud, normal and
@@ -286,7 +323,8 @@ matter.
 ## Continuous integration
 
 Every push and pull request runs the host tests and builds the example
-with both the legacy `make` and the CMake build systems. The ESP8266_RTOS_SDK and the toolchain
+with both the legacy `make` and the CMake build systems. In CI, compiler
+warnings in the library and the example are errors (`SOFTUART_WERROR=1`). The ESP8266_RTOS_SDK and the toolchain
 versions are pinned. The firmware images are uploaded as build artifacts.
 Pushing a `v*` tag also publishes a GitHub release with the images and a
 `flash_args` file.
@@ -318,6 +356,6 @@ The library is a port of a long line of open-source software UARTs:
 - 2016 and 2017: Bernhard Guillon and Ruslan V. Uss reworked it for [esp-open-rtos](https://github.com/SuperHouse/esp-open-rtos/tree/master/extras/softuart).
 - 2020: Ivan Belokobylskiy ([@devbis](https://github.com/devbis)) ported it to ESP8266_RTOS_SDK in [devbis/esp8266-rtos-softuart](https://github.com/devbis/esp8266-rtos-softuart).
 
-This repository packages that port with an example application and build
-tooling. It is released under the [MIT License](LICENSE). The source
+This repository packages that port as a reusable component, fixes several
+bugs, and adds tests, an example application and build tooling. It is released under the [MIT License](LICENSE). The source
 files keep their original authors' copyright notices.

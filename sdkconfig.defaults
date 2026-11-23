@@ -1,7 +1,6 @@
 # Project-specific configuration defaults for ESP8266_RTOS_SDK.
 # Everything not listed here uses the SDK default.
 
-# The demo application runs a tight loop that never yields to the idle task,
-# so watchdog panics stay disabled (as in the previously committed sdkconfig).
-# CONFIG_ESP8266_NMI_WDT is not set
-# CONFIG_ESP_TASK_WDT_PANIC is not set
+# Run the CPU at 160 MHz (the SDK default, made explicit): the software UART
+# times bits by busy-waiting, and a faster CPU polls the timer more often.
+CONFIG_ESP8266_DEFAULT_CPU_FREQ_160=y

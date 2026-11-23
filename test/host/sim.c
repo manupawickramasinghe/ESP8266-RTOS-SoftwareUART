@@ -3,10 +3,12 @@
  */
 #include "sim.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_log.h"
 #include "rom/ets_sys.h"
 
 /* Virtual cost of SDK calls, roughly what they take at 160 MHz. */
@@ -36,6 +38,7 @@ typedef struct {
 
 static uint64_t now_ns;
 static uint32_t base_us;
+static int log_counts[ESP_LOG_VERBOSE + 1];
 static bool isr_service;
 static sim_pin_t pins[GPIO_PIN_COUNT];
 
@@ -43,6 +46,7 @@ void sim_reset(uint32_t start_us)
 {
     now_ns = 0;
     base_us = start_us;
+    memset(log_counts, 0, sizeof(log_counts));
     isr_service = false;
     memset(pins, 0, sizeof(pins));
     for (int i = 0; i < GPIO_PIN_COUNT; i++) {
@@ -69,6 +73,22 @@ static sim_pin_t *pin_or_die(int pin)
 }
 
 /* ------------------------------------------------------------------ SDK */
+
+void sim_log(esp_log_level_t level, const char *tag, const char *fmt, ...)
+{
+    (void)tag;
+    log_counts[level]++;
+    if (getenv("SIM_VERBOSE")) {
+        va_list ap;
+        va_start(ap, fmt);
+        fprintf(stderr, "[%s] ", tag);
+        vfprintf(stderr, fmt, ap);
+        fputc('\n', stderr);
+        va_end(ap);
+    }
+}
+
+int sim_log_count(int level) { return log_counts[level]; }
 
 uint32_t esp_get_time(void)
 {

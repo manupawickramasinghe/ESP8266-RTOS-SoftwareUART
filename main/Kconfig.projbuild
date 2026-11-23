@@ -1,0 +1,36 @@
+menu "Software UART example"
+
+config EXAMPLE_SOFTUART_RX_GPIO
+    int "RX GPIO number"
+    range 0 15
+    default 4
+    help
+        GPIO that receives data (connect it to the other device's TX).
+        GPIO16 cannot be used because it has no interrupt. Avoid GPIO1 and
+        GPIO3 (console UART), GPIO6-11 (flash) and the boot-strapping pins
+        GPIO0, GPIO2 and GPIO15. The default GPIO4 is D2 on NodeMCU boards.
+
+config EXAMPLE_SOFTUART_TX_GPIO
+    int "TX GPIO number"
+    range 0 16
+    default 5
+    help
+        GPIO that transmits data (connect it to the other device's RX).
+        The default GPIO5 is D1 on NodeMCU boards.
+
+config EXAMPLE_SOFTUART_BAUD_RATE
+    int "Baud rate"
+    range 300 115200
+    default 9600
+    help
+        Line speed of the software UART. Lower rates tolerate interrupt
+        latency better; 9600 baud is the best-tested rate.
+
+config EXAMPLE_SOFTUART_INVERT
+    bool "Inverted (idle-low) line logic"
+    default n
+    help
+        Enable for devices whose serial line idles low (inverted TTL),
+        for example behind a single-transistor level shifter.
+
+endmenu

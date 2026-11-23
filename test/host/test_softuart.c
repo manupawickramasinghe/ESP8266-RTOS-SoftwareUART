@@ -314,6 +314,7 @@ static void test_reopen_discards_stale_bytes(void)
 static void test_open_validation(void)
 {
     begin("open rejects invalid arguments", 1000);
+    CHECK(sim_log_count(1) == 0, "unexpected error log");
     CHECK(!softuart_open(SOFTUART_MAX_UARTS, 9600, RX0, TX0, false), "accepted port %d",
           SOFTUART_MAX_UARTS);
     CHECK(!softuart_open(0, 0, RX0, TX0, false), "accepted baud rate 0");
@@ -321,6 +322,7 @@ static void test_open_validation(void)
     CHECK(!softuart_open(0, 9600, 17, TX0, false), "accepted RX GPIO17");
     CHECK(!softuart_open(0, 9600, RX0, 17, false), "accepted TX GPIO17");
     CHECK(!softuart_open(0, 9600, RX0, RX0, false), "accepted the same pin for RX and TX");
+    CHECK(sim_log_count(1) == 6, "expected one error log per rejected open, got %d", sim_log_count(1));
     CHECK(softuart_open(0, 9600, RX0, 16, false), "rejected GPIO16 as TX");
     CHECK(softuart_close(0), "close failed");
 

@@ -29,12 +29,24 @@ extern "C"
 {
 #endif
 
+#include "sdkconfig.h"
+
+// Defaults come from menuconfig ("Software UART (softuart)"); a compiler
+// definition of the same name still overrides them.
 #ifndef SOFTUART_MAX_UARTS
-    #define SOFTUART_MAX_UARTS 2
+    #ifdef CONFIG_SOFTUART_MAX_UARTS
+        #define SOFTUART_MAX_UARTS CONFIG_SOFTUART_MAX_UARTS
+    #else
+        #define SOFTUART_MAX_UARTS 2
+    #endif
 #endif
 
 #ifndef SOFTUART_MAX_RX_BUFF
-    #define SOFTUART_MAX_RX_BUFF 64 //!< Must be a power of two from 2 to 256
+    #ifdef CONFIG_SOFTUART_RX_BUFFER_SIZE
+        #define SOFTUART_MAX_RX_BUFF CONFIG_SOFTUART_RX_BUFFER_SIZE
+    #else
+        #define SOFTUART_MAX_RX_BUFF 64 //!< Must be a power of two from 2 to 256
+    #endif
 #endif
 
 /**

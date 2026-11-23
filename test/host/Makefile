@@ -5,11 +5,11 @@
 #
 # Needs only a C11 compiler; the ESP8266 SDK is not required.
 
-SRC_DIR   := ../../main
+SRC_DIR   := ../../components/softuart
 BUILD_DIR := build
 CC        ?= cc
 CFLAGS    ?= -O1 -g
-CFLAGS    += -std=c11 -Wall -Wextra -Werror -Imocks -I. -I$(SRC_DIR)
+CFLAGS    += -std=c11 -Wall -Wextra -Werror -Imocks -I. -I$(SRC_DIR)/include
 SANITIZE  ?= -fsanitize=address,undefined -fno-sanitize-recover=all
 LDLIBS    += -lm
 
@@ -22,7 +22,7 @@ all: test
 test: $(TEST)
 	./$(TEST)
 
-$(TEST): $(SRCS) sim.h $(SRC_DIR)/softuart.h $(wildcard mocks/*/*.h) | $(BUILD_DIR)
+$(TEST): $(SRCS) sim.h $(SRC_DIR)/include/softuart.h $(wildcard mocks/*.h mocks/*/*.h) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $(SRCS) $(LDLIBS)
 
 $(BUILD_DIR):

@@ -22,18 +22,13 @@
 
 #include "softuart.h"
 #include <stdint.h>
-#include <stdio.h>
 #include "driver/gpio.h"
+#include "esp_log.h"
 
 #include "rom/ets_sys.h"
 
-#define SOFTUART_DEBUG
-
-#ifdef SOFTUART_DEBUG
-#define debug(fmt, ...) printf("%s: " fmt "\n", "SOFTUART", ## __VA_ARGS__)
-#else
-#define debug(fmt, ...)
-#endif
+// Errors are logged from task context only, never from the interrupt handler
+static const char *TAG = "softuart";
 
 _Static_assert(SOFTUART_MAX_RX_BUFF >= 2 && SOFTUART_MAX_RX_BUFF <= 256
                && (SOFTUART_MAX_RX_BUFF & (SOFTUART_MAX_RX_BUFF - 1)) == 0,
@@ -140,7 +135,7 @@ static bool check_uart_no(uint8_t uart_no)
 {
     if (uart_no >= SOFTUART_MAX_UARTS)
     {
-        debug("Invalid uart number %u, %u max", uart_no, SOFTUART_MAX_UARTS);
+        ESP_LOGE(TAG, "Invalid uart number %u, must be below %d", uart_no, SOFTUART_MAX_UARTS);
         return false;
     }
 
@@ -151,7 +146,7 @@ static bool check_uart_enabled(uint8_t uart_no)
 {
     if (!uarts[uart_no].baudrate)
     {
-        debug("Uart %u is disabled", uart_no);
+        ESP_LOGD(TAG, "Uart %u is not open", uart_no);
         return false;
     }
 
@@ -179,30 +174,30 @@ bool softuart_open(uint8_t uart_no, uint32_t baudrate, uint32_t rx_pin, uint32_t
     if (!check_uart_no(uart_no)) return false;
     if (baudrate == 0 || baudrate > SOFTUART_MAX_BAUDRATE)
     {
-        debug("Invalid baudrate %u", (unsigned)baudrate);
+        ESP_LOGE(TAG, "Invalid baudrate %u", (unsigned)baudrate);
         return false;
     }
     // GPIO16 is an RTC GPIO without interrupt support, so it cannot receive
     if (!GPIO_IS_VALID_GPIO(rx_pin) || RTC_GPIO_IS_VALID_GPIO(rx_pin))
     {
-        debug("Invalid RX pin %u, must be GPIO0-15", (unsigned)rx_pin);
+        ESP_LOGE(TAG, "Invalid RX pin %u, must be GPIO0-15", (unsigned)rx_pin);
         return false;
     }
     if (!GPIO_IS_VALID_GPIO(tx_pin))
     {
-        debug("Invalid TX pin %u, must be GPIO0-16", (unsigned)tx_pin);
+        ESP_LOGE(TAG, "Invalid TX pin %u, must be GPIO0-16", (unsigned)tx_pin);
         return false;
     }
     if (rx_pin == tx_pin)
     {
-        debug("RX and TX must use different pins");
+        ESP_LOGE(TAG, "RX and TX must use different pins");
         return false;
     }
     for (uint8_t i = 0; i < SOFTUART_MAX_UARTS; i++)
         if (uarts[i].baudrate && i != uart_no
             && (uarts[i].rx_pin == rx_pin || uarts[i].tx_pin == tx_pin || uarts[i].rx_pin == tx_pin || uarts[i].tx_pin == rx_pin))
         {
-            debug("Cannot share pins between uarts");
+            ESP_LOGE(TAG, "Cannot share pins between uarts");
             return false;
         }
 
@@ -249,7 +244,7 @@ bool softuart_open(uint8_t uart_no, uint32_t baudrate, uint32_t rx_pin, uint32_t
     uart->baudrate = baudrate;
     if (gpio_isr_handler_add(rx_pin, handle_rx, uart) != ESP_OK)
     {
-        debug("Cannot attach the RX interrupt handler");
+        ESP_LOGE(TAG, "Cannot attach the RX interrupt handler");
         uart->baudrate = 0;
         release_isr_service();
         return false;
