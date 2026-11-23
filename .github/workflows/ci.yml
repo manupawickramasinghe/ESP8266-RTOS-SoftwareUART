@@ -24,6 +24,19 @@ env:
   TOOLCHAIN_SHA256: 0a1804b5e2231c6db8b72af6bc2a0f9a5b6994cfba29956d412651109f13fe7e
 
 jobs:
+  host-tests:
+    name: Host tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run simulator tests (ASan + UBSan)
+        run: make -C test/host
+
   firmware:
     name: Firmware (${{ matrix.build-system }})
     runs-on: ubuntu-24.04
@@ -93,7 +106,7 @@ jobs:
   release:
     name: Publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: firmware
+    needs: [host-tests, firmware]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

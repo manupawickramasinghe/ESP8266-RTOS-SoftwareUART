@@ -25,6 +25,7 @@ transceivers and other low-speed serial peripherals.
 - [Configuration](#configuration)
 - [Limitations](#limitations)
 - [Project layout](#project-layout)
+- [Testing](#testing)
 - [Continuous integration](#continuous-integration)
 - [Contributing](#contributing)
 - [Credits and license](#credits-and-license)
@@ -185,8 +186,8 @@ All functions take the port index `uart_no`, from `0` to
 
 | Function | Description |
 |---|---|
-| `bool softuart_open(uint8_t uart_no, uint32_t baudrate, uint32_t rx_pin, uint32_t tx_pin, bool invert)` | Configure the pins, install the RX interrupt and start receiving. Re-opening a port reconfigures it. `invert = true` selects idle-low logic. Returns `false` for an invalid port, a baud rate of 0, or pins already used by another port. |
-| `bool softuart_close(uint8_t uart_no)` | Stop receiving and release the port. |
+| `bool softuart_open(uint8_t uart_no, uint32_t baudrate, uint32_t rx_pin, uint32_t tx_pin, bool invert)` | Configure the pins, install the RX interrupt and start receiving. Re-opening a port reconfigures it, and the receive buffer always starts empty. `invert = true` selects idle-low logic. Returns `false` for an invalid port, a baud rate outside 1 – 1,000,000, an RX pin outside GPIO0 – 15, a TX pin outside GPIO0 – 16, RX equal to TX, or pins already used by another port. |
+| `bool softuart_close(uint8_t uart_no)` | Stop receiving and release the port. Other ports keep running. The GPIO ISR service is uninstalled only if softuart installed it and no port is left open, so an application's own GPIO interrupts are not affected. |
 | `bool softuart_put(uint8_t uart_no, char c)` | Transmit one byte. Blocks for the length of the frame. |
 | `bool softuart_puts(uint8_t uart_no, const char *s)` | Transmit a NUL-terminated string. |
 | `bool softuart_putn(uint8_t uart_no, const uint8_t *s, size_t n)` | Transmit `n` bytes from a buffer. |
@@ -201,7 +202,7 @@ with compiler definitions:
 | Macro | Default | Meaning |
 |---|---|---|
 | `SOFTUART_MAX_UARTS` | `2` | Number of software UART ports |
-| `SOFTUART_MAX_RX_BUFF` | `64` | Receive ring-buffer size per port, in bytes (a power of two, at most 256). One slot stays free, so a port holds up to `SOFTUART_MAX_RX_BUFF - 1` bytes. |
+| `SOFTUART_MAX_RX_BUFF` | `64` | Receive ring-buffer size per port, in bytes. Must be a power of two from 2 to 256 (checked at compile time). One slot stays free, so a port holds up to `SOFTUART_MAX_RX_BUFF - 1` bytes. When the buffer is full, newer bytes are dropped. |
 
 ```cmake
 # CMake: in the component's CMakeLists.txt, after idf_component_register()
@@ -251,16 +252,41 @@ UART for slow peripherals.
 │   ├── hello_world_main.c     # example application
 │   ├── CMakeLists.txt         # component registration (CMake build)
 │   └── component.mk           # component makefile (legacy make build)
+├── test/host/                 # simulator-based unit tests (run on the build machine)
 ├── scripts/ci-build.sh        # build + stage firmware (used by CI)
 ├── sdkconfig.defaults         # project configuration defaults
 ├── CMakeLists.txt / Makefile  # project files for idf.py / make
 └── .github/workflows/ci.yml   # GitHub Actions workflow
 ```
 
+## Testing
+
+`test/host/` contains unit tests that compile `softuart.c` for the build
+machine against a small ESP8266 simulator. The simulator models virtual
+time, GPIO levels and the GPIO ISR service. The tests cover:
+
+- **Transmit.** Every byte value at 9600 and 38400 baud, normal and
+  inverted, decoded from the generated waveform. Every bit edge must sit
+  within 5 % of a bit of its ideal position, with no glitches.
+- **Receive.** Every byte value, including back-to-back frames, delivered
+  through the interrupt handler with simulated interrupt latency.
+- **Timer wrap.** Frames in flight while the 32-bit microsecond timer
+  crosses 2³¹ and wraps at 2³².
+- **Lifecycle.** Opening, re-opening and closing ports, input validation,
+  ring-buffer overflow, and GPIO ISR service ownership.
+
+```sh
+make -C test/host      # needs only a C11 compiler; runs with ASan and UBSan
+```
+
+These tests check the logic and timing arithmetic. They do not replace
+testing on real hardware, where interrupt latency and Wi-Fi activity
+matter.
+
 ## Continuous integration
 
-Every push and pull request builds the example with both the legacy
-`make` and the CMake build systems. The ESP8266_RTOS_SDK and the toolchain
+Every push and pull request runs the host tests and builds the example
+with both the legacy `make` and the CMake build systems. The ESP8266_RTOS_SDK and the toolchain
 versions are pinned. The firmware images are uploaded as build artifacts.
 Pushing a `v*` tag also publishes a GitHub release with the images and a
 `flash_args` file.
@@ -277,7 +303,8 @@ ls dist/                    # bootloader.bin, partition-table.bin, softuart-exam
 Issues and pull requests are welcome. Please:
 
 1. Keep changes building with **both** `make` and `idf.py`
-   (`scripts/ci-build.sh make && scripts/ci-build.sh cmake`).
+   (`scripts/ci-build.sh make && scripts/ci-build.sh cmake`), and keep the
+   host tests passing (`make -C test/host`). Add a test for every bug fix.
 2. Follow the existing code style (4-space indentation, braces on their own
    line in the library).
 3. Describe how you tested the change, especially on real hardware, in the

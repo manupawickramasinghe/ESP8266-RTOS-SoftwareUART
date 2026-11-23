@@ -34,29 +34,33 @@ extern "C"
 #endif
 
 #ifndef SOFTUART_MAX_RX_BUFF
-    #define SOFTUART_MAX_RX_BUFF 64 //!< Must be power of two: 2, 4, 8, 16 etc.
+    #define SOFTUART_MAX_RX_BUFF 64 //!< Must be a power of two from 2 to 256
 #endif
 
 /**
- * Initialize software uart and setup interrupt handler
- * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS
- * @param baudrate Baudrate, e.g. 9600, 19200, etc
- * @param rx_pin GPIO pin number for RX
- * @param tx_pin GPIO pin number for TX
+ * Initialize software uart and setup interrupt handler.
+ * Opening a port that is already open reconfigures it; the receive buffer
+ * is emptied either way.
+ * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS-1
+ * @param baudrate Baudrate, e.g. 9600, 19200, etc (1..1000000)
+ * @param rx_pin GPIO pin number for RX, GPIO0-15 (GPIO16 has no interrupt)
+ * @param tx_pin GPIO pin number for TX, GPIO0-16, different from rx_pin
+ * @param invert true for inverted (idle-low) line logic
  * @return true if no errors occured otherwise false
  */
 bool softuart_open(uint8_t uart_no, uint32_t baudrate, uint32_t rx_pin, uint32_t tx_pin, bool invert);
 
 /**
- * Deinitialize software uart
- * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS
+ * Deinitialize software uart. Other open ports keep working, and a GPIO ISR
+ * service installed by the application is left in place.
+ * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS-1
  * @return true if no errors occured otherwise false
  */
 bool softuart_close(uint8_t uart_no);
 
 /**
  * Put char to software uart
- * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS
+ * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS-1
  * @param c Char
  * @return true if no errors occured otherwise false
  */
@@ -64,7 +68,7 @@ bool softuart_put(uint8_t uart_no, char c);
 
 /**
  * Put string to software uart
- * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS
+ * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS-1
  * @param s Null-terminated string
  * @return true if no errors occured otherwise false
  */
@@ -72,12 +76,16 @@ bool softuart_puts(uint8_t uart_no, const char *s);
 
 /**
  * Put string with length to software uart
+ * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS-1
+ * @param s Bytes to send
+ * @param n Number of bytes
+ * @return true if no errors occured otherwise false
  */
 bool softuart_putn(uint8_t uart_no, const uint8_t* s, size_t n);
 
 /**
  * Check if data is available
- * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS
+ * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS-1
  * @return true if data is available otherwise false
  */
 bool softuart_available(uint8_t uart_no);
@@ -87,7 +95,7 @@ bool softuart_available(uint8_t uart_no);
  *
  * NOTE: This call is non blocking.
  * NOTE: You have to check softuart_available() first.
- * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS
+ * @param uart_no Software uart index, 0..SOFTUART_MAX_UARTS-1
  * @return current byte if available otherwise 0
  */
 uint8_t softuart_read(uint8_t uart_no);
