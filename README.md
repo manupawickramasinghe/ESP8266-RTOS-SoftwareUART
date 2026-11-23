@@ -11,8 +11,8 @@ ESP-IDF style), plus an example application.
 
 The ESP8266 has one full UART (UART0, used by the console and the
 bootloader) and a transmit-only UART1. This library adds more serial
-ports on ordinary GPIOs. Use them for GPS receivers, sensors, RS-485
-transceivers and other low-speed serial peripherals.
+ports on ordinary GPIOs. Use them for GPS receivers, sensors, debug
+consoles and other low-speed serial peripherals.
 
 ## Contents
 
@@ -256,6 +256,13 @@ All functions take the port index `uart_no`, from `0` to
 
 The receive functions of one port are meant for one task: the ring
 buffer has a single consumer. Use a mutex if several tasks share a port.
+
+softuart receives through the SDK's GPIO ISR service. If your application
+also uses GPIO interrupts, call `gpio_install_isr_service(0)` **before**
+the first `softuart_open()`. softuart then shares the service and never
+uninstalls it. If you install it later, the SDK returns `ESP_FAIL`
+("already installed"), which aborts under `ESP_ERROR_CHECK`. Register
+your handlers with `gpio_isr_handler_add()` as usual.
 
 ## Configuration
 
