@@ -22,8 +22,8 @@
 
 #include "softuart.h"
 #include <stdint.h>
-#include "driver/gpio.h"
 #include <stdio.h>
+#include "driver/gpio.h"
 
 #include "rom/ets_sys.h"
 
@@ -35,6 +35,14 @@
 #define debug(fmt, ...)
 #endif
 
+_Static_assert(SOFTUART_MAX_RX_BUFF >= 2 && SOFTUART_MAX_RX_BUFF <= 256
+               && (SOFTUART_MAX_RX_BUFF & (SOFTUART_MAX_RX_BUFF - 1)) == 0,
+               "SOFTUART_MAX_RX_BUFF must be a power of two between 2 and 256");
+
+// Highest baud rate whose bit time is still at least 1 us
+#define SOFTUART_MAX_BAUDRATE 1000000
+
+// Free-running 32-bit microsecond timer (wraps every ~71.6 minutes)
 extern uint32_t esp_get_time(void);
 
 typedef struct
@@ -50,49 +58,52 @@ typedef struct
     uint32_t rx_pin, tx_pin;
     uint32_t baudrate;
     volatile softuart_buffer_t buffer;
-    uint16_t bit_time;
+    uint32_t bit_time;
     bool invert;
 } softuart_t;
 
 static softuart_t uarts[SOFTUART_MAX_UARTS] = { { 0 } };
 
-inline static int8_t find_uart_by_rx(uint8_t rx_pin)
-{
-    for (uint8_t i = 0; i < SOFTUART_MAX_UARTS; i++)
-        if (uarts[i].baudrate && uarts[i].rx_pin == rx_pin) return i;
+// Number of open ports
+static uint8_t open_uarts;
+// True if softuart installed the GPIO ISR service (and so may uninstall it)
+static bool isr_service_owned;
 
-    return -1;
+// Busy-wait until `us` microseconds have passed since `start`. The unsigned
+// subtraction stays correct when the timer wraps around.
+static inline void wait_until(uint32_t start, uint32_t us)
+{
+    while ((uint32_t)(esp_get_time() - start) < us)
+    {
+    }
 }
 
-// GPIO interrupt handler
+// Busy-wait for `us` microseconds. Unlike ets_delay_us(), which is the ROM's
+// os_delay_us(uint16_t), this does not truncate delays above 65535 us.
+static inline void delay_us(uint32_t us)
+{
+    wait_until(esp_get_time(), us);
+}
+
+// GPIO interrupt handler, called on the leading edge of a start bit
 static void handle_rx(void *arg)
 {
-    uint32_t gpio_num = (uint32_t) arg;
-    // find uart
-    int8_t uart_no = find_uart_by_rx(gpio_num);
-    if (uart_no < 0) return;
-
-    softuart_t *uart = uarts + uart_no;
+    softuart_t *uart = (softuart_t *)arg;
+    if (!uart->baudrate) return;
 
     // Disable interrupt
-    gpio_set_intr_type(gpio_num, GPIO_INTR_DISABLE);
-    // gpio_isr_handler_remove(gpio_num);
+    gpio_set_intr_type(uart->rx_pin, GPIO_INTR_DISABLE);
 
     // Wait till start bit is half over so we can sample the next one in the center
-    ets_delay_us(uart->bit_time / 2);
+    delay_us(uart->bit_time / 2);
 
     // Now sample bits
     uint8_t d = 0;
-    uint32_t start_time = 0x7FFFFFFF & esp_get_time();
+    uint32_t start_time = esp_get_time();
 
     for (uint8_t i = 0; i < 8; i++)
     {
-        while ((0x7FFFFFFF & esp_get_time()) < (start_time + (uart->bit_time * (i + 1))))
-        {
-            // If system timer overflow, escape from while loop
-            if ((0x7FFFFFFF & esp_get_time()) < start_time)
-                break;
-        }
+        wait_until(start_time, uart->bit_time * (i + 1));
         // Shift d to the right
         d >>= 1;
 
@@ -106,7 +117,7 @@ static void handle_rx(void *arg)
 
     // Store byte in buffer
     // If buffer full, set the overflow flag and return
-    uint8_t next = (uart->buffer.receive_buffer_tail + 1) % SOFTUART_MAX_RX_BUFF;
+    uint8_t next = (uint8_t)((uart->buffer.receive_buffer_tail + 1) % SOFTUART_MAX_RX_BUFF);
     if (next != uart->buffer.receive_buffer_head)
     {
         // save new data in buffer: tail points to where byte goes
@@ -119,18 +130,17 @@ static void handle_rx(void *arg)
     }
 
     // Wait for stop bit
-    ets_delay_us(uart->bit_time);
+    delay_us(uart->bit_time);
 
     // Done, reenable interrupt
     gpio_set_intr_type(uart->rx_pin, uart->invert ? GPIO_INTR_POSEDGE : GPIO_INTR_NEGEDGE);
-    // gpio_isr_handler_add(uart->rx_pin, handle_rx, (void *)(uart->rx_pin));
 }
 
 static bool check_uart_no(uint8_t uart_no)
 {
     if (uart_no >= SOFTUART_MAX_UARTS)
     {
-        debug("Invalid uart number %d, %d max", uart_no, SOFTUART_MAX_UARTS);
+        debug("Invalid uart number %u, %u max", uart_no, SOFTUART_MAX_UARTS);
         return false;
     }
 
@@ -141,11 +151,22 @@ static bool check_uart_enabled(uint8_t uart_no)
 {
     if (!uarts[uart_no].baudrate)
     {
-        debug("Uart %d is disabled", uart_no);
+        debug("Uart %u is disabled", uart_no);
         return false;
     }
 
     return true;
+}
+
+// Uninstall the GPIO ISR service once no port needs it, but only if softuart
+// installed it: the application may use it for its own GPIO interrupts.
+static void release_isr_service(void)
+{
+    if (open_uarts == 0 && isr_service_owned)
+    {
+        gpio_uninstall_isr_service();
+        isr_service_owned = false;
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -156,9 +177,25 @@ bool softuart_open(uint8_t uart_no, uint32_t baudrate, uint32_t rx_pin, uint32_t
 {
     // do some checks
     if (!check_uart_no(uart_no)) return false;
-    if (baudrate == 0)
+    if (baudrate == 0 || baudrate > SOFTUART_MAX_BAUDRATE)
     {
-        debug("Invalid baudrate");
+        debug("Invalid baudrate %u", (unsigned)baudrate);
+        return false;
+    }
+    // GPIO16 is an RTC GPIO without interrupt support, so it cannot receive
+    if (!GPIO_IS_VALID_GPIO(rx_pin) || RTC_GPIO_IS_VALID_GPIO(rx_pin))
+    {
+        debug("Invalid RX pin %u, must be GPIO0-15", (unsigned)rx_pin);
+        return false;
+    }
+    if (!GPIO_IS_VALID_GPIO(tx_pin))
+    {
+        debug("Invalid TX pin %u, must be GPIO0-16", (unsigned)tx_pin);
+        return false;
+    }
+    if (rx_pin == tx_pin)
+    {
+        debug("RX and TX must use different pins");
         return false;
     }
     for (uint8_t i = 0; i < SOFTUART_MAX_UARTS; i++)
@@ -173,10 +210,14 @@ bool softuart_open(uint8_t uart_no, uint32_t baudrate, uint32_t rx_pin, uint32_t
 
     softuart_t *uart = uarts + uart_no;
 
-    uart->baudrate = baudrate;
     uart->rx_pin = rx_pin;
     uart->tx_pin = tx_pin;
     uart->invert = invert;
+
+    // Discard anything left over from a previous session
+    uart->buffer.receive_buffer_head = 0;
+    uart->buffer.receive_buffer_tail = 0;
+    uart->buffer.buffer_overflow = 0;
 
     // Calculate bit_time
     uart->bit_time = (1000000 / baudrate);
@@ -186,31 +227,37 @@ bool softuart_open(uint8_t uart_no, uint32_t baudrate, uint32_t rx_pin, uint32_t
     gpio_config_t io_conf;
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pin_bit_mask = 1ULL<<rx_pin;
+    io_conf.pin_bit_mask = 1UL << rx_pin;
     io_conf.pull_down_en = 0;
     io_conf.pull_up_en = 1;
     gpio_config(&io_conf);
-
-    // gpio_enable(rx_pin, GPIO_MODE_INPUT);
-    // gpio_pullup_en(rx_pin);
 
     // Setup Tx
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pin_bit_mask = 1ULL<<tx_pin;
+    io_conf.pin_bit_mask = 1UL << tx_pin;
     io_conf.pull_down_en = 0;
     io_conf.pull_up_en = 1;
     gpio_config(&io_conf);
-
-    // gpio_enable(tx_pin, GPIO_MODE_OUTPUT);
-    // gpio_pullup_en(tx_pin);
     gpio_set_level(tx_pin, !uart->invert);
 
-    //install gpio isr service
-    gpio_install_isr_service(0);
+    // Install the GPIO ISR service unless it is already installed, either by
+    // an open port or by the application (then the SDK returns ESP_FAIL).
+    if (open_uarts == 0 && !isr_service_owned)
+        isr_service_owned = gpio_install_isr_service(0) == ESP_OK;
+
+    uart->baudrate = baudrate;
+    if (gpio_isr_handler_add(rx_pin, handle_rx, uart) != ESP_OK)
+    {
+        debug("Cannot attach the RX interrupt handler");
+        uart->baudrate = 0;
+        release_isr_service();
+        return false;
+    }
+    open_uarts++;
+
     // Setup the interrupt handler to get the start bit
     gpio_set_intr_type(rx_pin, uart->invert ? GPIO_INTR_POSEDGE : GPIO_INTR_NEGEDGE);
-    gpio_isr_handler_add(rx_pin, handle_rx, (void *)rx_pin);
 
     ets_delay_us(1000); // TODO: not sure if it really needed
 
@@ -226,9 +273,11 @@ bool softuart_close(uint8_t uart_no)
 
     // Remove interrupt
     gpio_set_intr_type(uart->rx_pin, GPIO_INTR_DISABLE);
+    gpio_isr_handler_remove(uart->rx_pin);
     // Mark as unused
     uart->baudrate = 0;
-    gpio_uninstall_isr_service();
+    open_uarts--;
+    release_isr_service();
 
     return true;
 }
@@ -238,33 +287,30 @@ bool softuart_put(uint8_t uart_no, char c)
     if (!check_uart_no(uart_no)) return false;
     if (!check_uart_enabled(uart_no)) return false;
     softuart_t *uart = uarts + uart_no;
+    const uint8_t data = (uint8_t)c;
 
-    uint32_t start_time = 0x7FFFFFFF & esp_get_time();
+    // Start bit
+    uint32_t start_time = esp_get_time();
     gpio_set_level(uart->tx_pin, uart->invert);
 
-    for (uint8_t i = 0; i <= 8; i++)
+    // Data bits, LSB first
+    for (uint8_t i = 0; i < 8; i++)
     {
-        while ((0x7FFFFFFF & esp_get_time()) < (start_time + (uart->bit_time * (i + 1))))
-        {
-            if ((0x7FFFFFFF & esp_get_time()) < start_time)
-                break;
-        }
-        gpio_set_level(uart->tx_pin, c & ((!uart->invert) << i));
+        wait_until(start_time, uart->bit_time * (i + 1));
+        gpio_set_level(uart->tx_pin, ((data >> i) & 1) ^ uart->invert);
     }
 
-    while ((0x7FFFFFFF & esp_get_time()) < (start_time + (uart->bit_time * 9)))
-    {
-        if ((0x7FFFFFFF & esp_get_time()) < start_time)
-            break;
-    }
+    // Stop bit, followed by idle time before the next byte
+    wait_until(start_time, uart->bit_time * 9);
     gpio_set_level(uart->tx_pin, !uart->invert);
-    ets_delay_us(uart->bit_time * 6);
+    delay_us(uart->bit_time * 6);
 
     return true;
 }
 
 bool softuart_puts(uint8_t uart_no, const char *s)
 {
+    if (s == NULL) return false;
     while (*s)
     {
         if (!softuart_put(uart_no, *s++))
@@ -273,7 +319,6 @@ bool softuart_puts(uint8_t uart_no, const char *s)
 
     return true;
 }
-
 bool softuart_putn(uint8_t uart_no, const uint8_t* s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         if (!softuart_put(uart_no, s[i])) {
@@ -304,6 +349,6 @@ uint8_t softuart_read(uint8_t uart_no)
 
     // Read from "head"
     uint8_t d = uart->buffer.receive_buffer[uart->buffer.receive_buffer_head]; // grab next byte
-    uart->buffer.receive_buffer_head = (uart->buffer.receive_buffer_head + 1) % SOFTUART_MAX_RX_BUFF;
+    uart->buffer.receive_buffer_head = (uint8_t)((uart->buffer.receive_buffer_head + 1) % SOFTUART_MAX_RX_BUFF);
     return d;
 }
