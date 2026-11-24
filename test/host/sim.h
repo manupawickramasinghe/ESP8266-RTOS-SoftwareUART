@@ -47,6 +47,10 @@ void sim_queue_frame(int pin, uint64_t start_ns, uint8_t byte, uint32_t baud, bo
  */
 int sim_deliver_frames(int pin, uint64_t latency_ns);
 
+/* --- logging ------------------------------------------------------------ */
+/* Messages logged at an esp_log_level_t level since sim_reset(). */
+int sim_log_count(int level);
+
 /* --- interrupt controller --------------------------------------------- */
 bool sim_isr_service_installed(void);
 bool sim_isr_handler_registered(int pin);

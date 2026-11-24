@@ -13,6 +13,8 @@ project=softuart-example
 : "${IDF_PATH:?IDF_PATH must point at ESP8266_RTOS_SDK}"
 python=${PYTHON:-python}
 jobs=${JOBS:-$(nproc)}
+# Treat compiler warnings in the softuart component and the example as errors
+export SOFTUART_WERROR=1
 
 cd "$(dirname "$0")/.."
 rm -rf dist
