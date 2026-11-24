@@ -13,6 +13,7 @@
 #include "esp_clk.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "rom/ets_sys.h"
 
 /* Virtual cost of SDK calls and register accesses, roughly at 160 MHz. */
@@ -49,6 +50,8 @@ static uint32_t ccount_base;
 static int log_counts[ESP_LOG_VERBOSE + 1];
 static bool isr_service;
 static int critical_depth;
+static sim_delay_hook_t delay_hook;
+static int delay_calls;
 static int critical_entries;
 static sim_pin_t pins[GPIO_PIN_COUNT];
 
@@ -66,6 +69,8 @@ void sim_reset(uint32_t start_us)
     memset(log_counts, 0, sizeof(log_counts));
     isr_service = false;
     critical_depth = 0;
+    delay_hook = NULL;
+    delay_calls = 0;
     critical_entries = 0;
     memset(&regs, 0, sizeof(regs));
     last_reg_access_ns = 0;
@@ -143,6 +148,25 @@ void sim_exit_critical(void)
 }
 
 int sim_critical_depth(void) { return critical_depth; }
+
+TickType_t xTaskGetTickCount(void) { return (TickType_t)(now_ns / (portTICK_PERIOD_MS * 1000000ull)); }
+
+void vTaskDelay(TickType_t ticks)
+{
+    if (critical_depth) {
+        fprintf(stderr, "sim: vTaskDelay inside a critical section\n");
+        abort();
+    }
+    delay_calls++;
+    uint64_t tick_ns = portTICK_PERIOD_MS * 1000000ull;
+    /* wake at the next tick boundary(s), like the scheduler */
+    uint64_t wake = (now_ns / tick_ns + ticks) * tick_ns;
+    if (delay_hook) delay_hook(wake);
+    sim_advance_to_ns(wake);
+}
+
+void sim_set_delay_hook(sim_delay_hook_t hook) { delay_hook = hook; }
+int sim_delay_calls(void) { return delay_calls; }
 int sim_critical_entries(void) { return critical_entries; }
 
 static void record_level(sim_pin_t *p, int pin, int level, uint64_t t)

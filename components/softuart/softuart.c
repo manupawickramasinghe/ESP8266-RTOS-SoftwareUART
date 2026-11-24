@@ -21,7 +21,10 @@
  */
 
 #include "softuart.h"
+#include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "driver/gpio.h"
 #include "driver/soc.h"
 #include "esp8266/gpio_struct.h"
@@ -29,6 +32,7 @@
 #include "esp_clk.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "rom/ets_sys.h"
 
@@ -388,26 +392,135 @@ bool softuart_putn(uint8_t uart_no, const uint8_t* s, size_t n) {
     return true;
 }
 
+// Number of bytes waiting in a port's receive buffer
+static size_t rx_count(const softuart_t *uart)
+{
+    return (size_t)((uart->buffer.receive_buffer_tail + SOFTUART_MAX_RX_BUFF - uart->buffer.receive_buffer_head)
+                    % SOFTUART_MAX_RX_BUFF);
+}
+
+// Take the oldest byte from a port's receive buffer
+static bool rx_pop(softuart_t *uart, uint8_t *byte)
+{
+    // Empty buffer?
+    if (uart->buffer.receive_buffer_head == uart->buffer.receive_buffer_tail) return false;
+
+    // Read from "head"
+    *byte = (uint8_t)uart->buffer.receive_buffer[uart->buffer.receive_buffer_head]; // grab next byte
+    uart->buffer.receive_buffer_head = (uint8_t)((uart->buffer.receive_buffer_head + 1) % SOFTUART_MAX_RX_BUFF);
+    return true;
+}
+
 bool softuart_available(uint8_t uart_no)
+{
+    return softuart_rx_count(uart_no) > 0;
+}
+
+size_t softuart_rx_count(uint8_t uart_no)
+{
+    if (!check_uart_no(uart_no)) return 0;
+    if (!check_uart_enabled(uart_no)) return 0;
+
+    return rx_count(uarts + uart_no);
+}
+
+uint8_t softuart_read(uint8_t uart_no)
+{
+    uint8_t d = 0;
+    softuart_read_byte(uart_no, &d);
+    return d;
+}
+
+bool softuart_read_byte(uint8_t uart_no, uint8_t *byte)
+{
+    if (!check_uart_no(uart_no)) return false;
+    if (!check_uart_enabled(uart_no)) return false;
+    if (byte == NULL) return false;
+
+    return rx_pop(uarts + uart_no, byte);
+}
+
+size_t softuart_read_bytes(uint8_t uart_no, void *buf, size_t len, uint32_t timeout_ms)
+{
+    if (!check_uart_no(uart_no)) return 0;
+    if (!check_uart_enabled(uart_no)) return 0;
+    if (buf == NULL || len == 0) return 0;
+    softuart_t *uart = uarts + uart_no;
+    uint8_t *out = (uint8_t *)buf;
+
+    // Round up so that any non-zero timeout waits at least one tick
+    const TickType_t timeout = (TickType_t)((timeout_ms + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS);
+    const TickType_t start = xTaskGetTickCount();
+    size_t n = 0;
+
+    for (;;)
+    {
+        while (n < len && rx_pop(uart, out + n)) n++;
+        if (n == len || !uart->baudrate) break;
+        if (timeout_ms != SOFTUART_WAIT_FOREVER && (TickType_t)(xTaskGetTickCount() - start) >= timeout) break;
+        // The receive interrupt fills the buffer meanwhile
+        vTaskDelay(1);
+    }
+
+    return n;
+}
+
+bool softuart_rx_flush(uint8_t uart_no)
 {
     if (!check_uart_no(uart_no)) return false;
     if (!check_uart_enabled(uart_no)) return false;
     softuart_t *uart = uarts + uart_no;
 
-    return (uart->buffer.receive_buffer_tail + SOFTUART_MAX_RX_BUFF - uart->buffer.receive_buffer_head) % SOFTUART_MAX_RX_BUFF;
+    // Drop everything the interrupt handler has stored so far
+    uart->buffer.receive_buffer_head = uart->buffer.receive_buffer_tail;
+    return true;
 }
 
-uint8_t softuart_read(uint8_t uart_no)
+bool softuart_rx_overflow(uint8_t uart_no)
 {
-    if (!check_uart_no(uart_no)) return 0;
-    if (!check_uart_enabled(uart_no)) return 0;
+    if (!check_uart_no(uart_no)) return false;
+    if (!check_uart_enabled(uart_no)) return false;
     softuart_t *uart = uarts + uart_no;
 
-    // Empty buffer?
-    if (uart->buffer.receive_buffer_head == uart->buffer.receive_buffer_tail) return 0;
+    // Read and clear atomically with respect to the interrupt handler
+    portENTER_CRITICAL();
+    const bool overflow = uart->buffer.buffer_overflow != 0;
+    uart->buffer.buffer_overflow = 0;
+    portEXIT_CRITICAL();
 
-    // Read from "head"
-    uint8_t d = uart->buffer.receive_buffer[uart->buffer.receive_buffer_head]; // grab next byte
-    uart->buffer.receive_buffer_head = (uint8_t)((uart->buffer.receive_buffer_head + 1) % SOFTUART_MAX_RX_BUFF);
-    return d;
+    return overflow;
+}
+
+int softuart_printf(uint8_t uart_no, const char *format, ...)
+{
+    if (!check_uart_no(uart_no)) return -1;
+    if (!check_uart_enabled(uart_no)) return -1;
+    if (format == NULL) return -1;
+
+    char small[128];
+    va_list args;
+    va_start(args, format);
+    int len = vsnprintf(small, sizeof(small), format, args);
+    va_end(args);
+    if (len < 0) return -1;
+
+    char *text = small;
+    if ((size_t)len >= sizeof(small))
+    {
+        // Longer than the stack buffer: format again into a heap buffer
+        text = malloc((size_t)len + 1);
+        if (text == NULL)
+        {
+            ESP_LOGE(TAG, "Out of memory formatting %d bytes", len);
+            return -1;
+        }
+        va_start(args, format);
+        vsnprintf(text, (size_t)len + 1, format, args);
+        va_end(args);
+    }
+
+    bool ok = softuart_putn(uart_no, (const uint8_t *)text, (size_t)len);
+    if (text != small) free(text);
+
+    return ok ? len : -1;
 }

@@ -11,8 +11,8 @@ ESP-IDF style), plus an example application.
 
 The ESP8266 has one full UART (UART0, used by the console and the
 bootloader) and a transmit-only UART1. This library adds more serial
-ports on ordinary GPIOs. Use them for GPS receivers, sensors, RS-485
-transceivers and other low-speed serial peripherals.
+ports on ordinary GPIOs. Use them for GPS receivers, sensors, debug
+consoles and other low-speed serial peripherals.
 
 ## Contents
 
@@ -38,8 +38,10 @@ transceivers and other low-speed serial peripherals.
 - Bit timing from the CPU cycle counter: every bit edge lands within one
   CPU cycle of its exact position at any baud rate, with no drift.
 - Optional inverted line logic, for links that idle low.
-- Interrupt-driven receive into a per-port ring buffer (64 bytes by default).
-- Blocking transmit of single bytes, C strings or byte buffers.
+- Interrupt-driven receive into a per-port ring buffer (64 bytes by default),
+  with non-blocking and timed reads plus overflow detection.
+- Blocking transmit of single bytes, C strings, byte buffers or
+  `printf`-formatted text.
 - Packaged as a reusable ESP-IDF component, configured through `menuconfig`.
 - Builds with both the legacy GNU Make and the CMake (`idf.py`) build systems.
 
@@ -219,10 +221,14 @@ void app_main(void)
     softuart_puts(SENSOR_UART, "hello\r\n");
 
     while (true) {
-        while (softuart_available(SENSOR_UART)) {
-            putchar(softuart_read(SENSOR_UART));
+        uint8_t buf[32];
+        // Wait up to 100 ms for data; returns early once buf is full
+        size_t n = softuart_read_bytes(SENSOR_UART, buf, sizeof(buf), 100);
+        fwrite(buf, 1, n, stdout);
+
+        if (softuart_rx_overflow(SENSOR_UART)) {
+            printf("\nreceive buffer overflowed\n");
         }
-        vTaskDelay(pdMS_TO_TICKS(10));   // yield so the idle task and watchdog run
     }
 }
 ```
@@ -239,8 +245,24 @@ All functions take the port index `uart_no`, from `0` to
 | `bool softuart_put(uint8_t uart_no, char c)` | Transmit one byte. Blocks for the length of the frame. |
 | `bool softuart_puts(uint8_t uart_no, const char *s)` | Transmit a NUL-terminated string. |
 | `bool softuart_putn(uint8_t uart_no, const uint8_t *s, size_t n)` | Transmit `n` bytes from a buffer. |
+| `int softuart_printf(uint8_t uart_no, const char *format, ...)` | Format like `printf()` and transmit. Returns the number of bytes sent or `-1`. Output longer than 127 bytes is formatted in a temporary heap buffer. |
 | `bool softuart_available(uint8_t uart_no)` | `true` if at least one received byte is waiting in the buffer. |
-| `uint8_t softuart_read(uint8_t uart_no)` | Pop the next received byte. Returns `0` if the buffer is empty, so call `softuart_available()` first. |
+| `size_t softuart_rx_count(uint8_t uart_no)` | Number of received bytes waiting in the buffer. |
+| `bool softuart_read_byte(uint8_t uart_no, uint8_t *byte)` | Take the next received byte without blocking. Returns `false` if the buffer is empty, so a received `0x00` is not mistaken for "no data". |
+| `size_t softuart_read_bytes(uint8_t uart_no, void *buf, size_t len, uint32_t timeout_ms)` | Read up to `len` bytes, waiting up to `timeout_ms` for them (`0`: only what is buffered, `SOFTUART_WAIT_FOREVER`: until `len` bytes arrive or the port closes). Sleeps one RTOS tick at a time while waiting, so call it from a task. |
+| `uint8_t softuart_read(uint8_t uart_no)` | Take the next received byte. Returns `0` if the buffer is empty, so call `softuart_available()` first or use `softuart_read_byte()`. |
+| `bool softuart_rx_flush(uint8_t uart_no)` | Discard all buffered received bytes. |
+| `bool softuart_rx_overflow(uint8_t uart_no)` | `true` if received bytes were dropped because the buffer was full since the previous call or since the port was opened. Clears the flag. |
+
+The receive functions of one port are meant for one task: the ring
+buffer has a single consumer. Use a mutex if several tasks share a port.
+
+softuart receives through the SDK's GPIO ISR service. If your application
+also uses GPIO interrupts, call `gpio_install_isr_service(0)` **before**
+the first `softuart_open()`. softuart then shares the service and never
+uninstalls it. If you install it later, the SDK returns `ESP_FAIL`
+("already installed"), which aborts under `ESP_ERROR_CHECK`. Register
+your handlers with `gpio_isr_handler_add()` as usual.
 
 ## Configuration
 
@@ -291,8 +313,10 @@ A software UART uses the CPU to time every bit, and that has costs:
 - **The CPU clock is read when a port opens.** Call `softuart_open()`
   again after changing the CPU frequency at run time.
 - **Only 8N1.** There is no parity, no 2-stop-bit mode and no flow control.
-- **A received NUL byte looks like "no data".** `softuart_read()` returns
-  `0` for both, so check `softuart_available()` first.
+- **Timed reads poll once per RTOS tick.** `softuart_read_bytes()` sleeps
+  one tick (10 ms by default) between checks. The receive buffer must hold
+  at least a tick's worth of data: about 10 bytes at 9600 baud, 115 bytes
+  at 115200.
 
 For high-speed or full-duplex links, use the hardware UART0 (with
 `uart_enable_swap()` to move it to GPIO13/GPIO15) and keep the software
@@ -337,6 +361,10 @@ time, GPIO levels and the GPIO ISR service. The tests cover:
   crosses 2³¹ and wraps at 2³².
 - **Lifecycle.** Opening, re-opening and closing ports, input validation,
   ring-buffer overflow, and GPIO ISR service ownership.
+- **Receive API.** `softuart_read_byte()` with a `0x00` byte,
+  `rx_count`, `rx_flush`, `rx_overflow`, and `softuart_read_bytes()` with
+  buffered data, a zero timeout, an expiring timeout and data arriving
+  while it sleeps. Also `softuart_printf()` with short and long output.
 
 The suite runs twice: once with the default configuration, and once with
 3 ports, a 16-byte buffer, 5 extra idle bits and the transmit critical

@@ -10,8 +10,7 @@
  * TX GPIO, GND <-> GND, then open it at the configured baud rate, 8N1.
  */
 #include <stdbool.h>
-#include <stdio.h>
-#include <string.h>
+#include <stdint.h>
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -50,8 +49,9 @@ void app_main(void)
     TickType_t last_heartbeat = xTaskGetTickCount();
 
     while (true) {
-        while (softuart_available(PORT)) {
-            char c = (char)softuart_read(PORT);
+        uint8_t byte;
+        while (softuart_read_byte(PORT, &byte)) {
+            char c = (char)byte;
 
             if (c == '\r' || c == '\n') {
                 softuart_puts(PORT, "\r\n");
@@ -69,11 +69,13 @@ void app_main(void)
             }
         }
 
+        if (softuart_rx_overflow(PORT)) {
+            ESP_LOGW(TAG, "receive buffer overflowed, some bytes were dropped");
+        }
+
         if (xTaskGetTickCount() - last_heartbeat >= pdMS_TO_TICKS(HEARTBEAT_PERIOD_MS)) {
-            char msg[48];
             last_heartbeat = xTaskGetTickCount();
-            snprintf(msg, sizeof(msg), "[heartbeat %u]\r\n", ++heartbeat);
-            softuart_puts(PORT, msg);
+            softuart_printf(PORT, "[heartbeat %u]\r\n", ++heartbeat);
         }
 
         // Yield so the idle task runs and feeds the task watchdog
