@@ -24,6 +24,9 @@ typedef struct {
 /* Reset all simulator state. The microsecond timer starts at start_us. */
 void sim_reset(uint32_t start_us);
 
+/* CPU clock used for the cycle counter (default 160 MHz after sim_reset()). */
+void sim_set_cpu_hz(uint32_t hz);
+
 uint64_t sim_now_ns(void);
 void sim_advance_ns(uint64_t ns);
 /* Advance virtual time to an absolute instant (no-op if already past it). */
@@ -50,6 +53,10 @@ int sim_deliver_frames(int pin, uint64_t latency_ns);
 /* --- logging ------------------------------------------------------------ */
 /* Messages logged at an esp_log_level_t level since sim_reset(). */
 int sim_log_count(int level);
+
+/* --- critical sections -------------------------------------------------- */
+int sim_critical_depth(void);   /* current portENTER_CRITICAL nesting */
+int sim_critical_entries(void); /* portENTER_CRITICAL calls since sim_reset() */
 
 /* --- interrupt controller --------------------------------------------- */
 bool sim_isr_service_installed(void);
