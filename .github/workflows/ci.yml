@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ESP8266_RTOS_SDK release/v3.4. Pinned to a commit so builds are
+  # reproducible; bump it deliberately (it is part of the cache key).
+  SDK_REPO: https://github.com/espressif/ESP8266_RTOS_SDK.git
+  SDK_COMMIT: 57350732cb9f4db41d29352a614c21d58e357f3d
+  # Toolchain required by release/v3.4 (tools/toolchain_versions.mk).
+  TOOLCHAIN_URL: https://dl.espressif.com/dl/xtensa-lx106-elf-gcc8_4_0-esp-2020r3-linux-amd64.tar.gz
+  TOOLCHAIN_SHA256: 0a1804b5e2231c6db8b72af6bc2a0f9a5b6994cfba29956d412651109f13fe7e
+
+jobs:
+  firmware:
+    name: Firmware (${{ matrix.build-system }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        build-system: [make, cmake]
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore SDK and toolchain
+        id: sdk-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/esp
+          key: esp8266-sdk-${{ env.SDK_COMMIT }}-${{ env.TOOLCHAIN_SHA256 }}
+
+      - name: Download SDK and toolchain
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/esp && cd ~/esp
+          curl -fsSL --retry 3 -o toolchain.tar.gz "$TOOLCHAIN_URL"
+          echo "$TOOLCHAIN_SHA256  toolchain.tar.gz" | sha256sum -c -
+          tar -xzf toolchain.tar.gz && rm toolchain.tar.gz
+          git init -q ESP8266_RTOS_SDK && cd ESP8266_RTOS_SDK
+          git remote add origin "$SDK_REPO"
+          git fetch -q --depth 1 origin "$SDK_COMMIT"
+          git checkout -q FETCH_HEAD
+          git submodule update -q --init --recursive --depth 1
+
+      - name: Set up Python and build tools
+        run: |
+          python3 -m venv ~/venv
+          # setuptools<70 keeps pkg_resources, which the SDK's
+          # check_python_dependencies.py still imports. CMake is held at
+          # 3.28 because the SDK's CMake scripts predate CMake 4.
+          ~/venv/bin/pip install --disable-pip-version-check -q \
+            "setuptools<70" "cmake~=3.28.0" ninja \
+            -r ~/esp/ESP8266_RTOS_SDK/requirements.txt
+          echo "$HOME/venv/bin" >> "$GITHUB_PATH"
+          echo "$HOME/esp/xtensa-lx106-elf/bin" >> "$GITHUB_PATH"
+          echo "IDF_PATH=$HOME/esp/ESP8266_RTOS_SDK" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: scripts/ci-build.sh ${{ matrix.build-system }}
+
+      - name: Size report
+        run: |
+          {
+            echo "### Firmware size (${{ matrix.build-system }})"
+            echo '```'
+            cat dist/size.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: firmware-${{ matrix.build-system }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: firmware
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download firmware
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: firmware-cmake
+          path: softuart-example-${{ github.ref_name }}
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          zip -qr "softuart-example-$TAG.zip" "softuart-example-$TAG"
+          gh release create "$TAG" "softuart-example-$TAG.zip" \
+            --repo "$GITHUB_REPOSITORY" --title "$TAG" \
+            --generate-notes --verify-tag

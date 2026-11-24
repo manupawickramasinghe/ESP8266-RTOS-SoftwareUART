@@ -1,5 +1,6 @@
-# Build output (legacy make and CMake/idf.py)
+# Build output (legacy make and CMake/idf.py) and staged firmware
 build/
+dist/
 
 # Generated configuration. Project defaults live in sdkconfig.defaults;
 # run `make menuconfig` or `idf.py menuconfig` to create a local sdkconfig.
