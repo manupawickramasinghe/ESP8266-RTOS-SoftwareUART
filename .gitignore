@@ -1,0 +1,17 @@
+# Build output (legacy make and CMake/idf.py)
+build/
+
+# Generated configuration. Project defaults live in sdkconfig.defaults;
+# run `make menuconfig` or `idf.py menuconfig` to create a local sdkconfig.
+sdkconfig
+sdkconfig.old
+
+# Host unit-test output
+test/host/build/
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
